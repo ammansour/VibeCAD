@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from .design_agent import DesignAgent, DesignAction, DesignActionType
+from .design_agent import DesignAgent, DesignAction, DesignActionType, normalize_action_parameters
 
 # Sub-agent orchestrator (optional — graceful fallback if not present).
 try:
@@ -138,11 +138,14 @@ class AgentLoop:
             'net_assign_warnings': 0,   # count of net assignment warnings/failures
             'routing_attempted': False,
         }
+        self._require_full_workflow: bool = False
         # Track add/delete cycles per component to detect death loops
-        self._component_add_count: Dict[str, int] = {}   # query/ref -> add attempts
+        self._component_add_fail_count: Dict[str, int] = {}   # query -> failed add attempts
         self._component_delete_count: Dict[str, int] = {} # ref -> delete count
         self._consecutive_fp_failures: int = 0            # consecutive footprint load failures
-        self._seen_search_queries: set = set()
+        self._search_query_last_iteration: Dict[str, int] = {}
+        self._search_query_cooldown_steps: int = 2
+        self._max_search_actions_per_step: int = 8
 
         # Threading
         self._pause_event = threading.Event()
@@ -240,6 +243,7 @@ class AgentLoop:
             return
 
         self._goal = goal
+        self._require_full_workflow = self._goal_requires_full_workflow(goal)
         self._iteration = 0
         self._drc_retry_count = 0
         self._last_drc_passed = None
@@ -254,10 +258,10 @@ class AgentLoop:
             'net_assign_warnings': 0,
             'routing_attempted': False,
         }
-        self._component_add_count = {}
+        self._component_add_fail_count = {}
         self._component_delete_count = {}
         self._consecutive_fp_failures = 0
-        self._seen_search_queries = set()
+        self._search_query_last_iteration = {}
         self._last_feedback: Optional[str] = None
         self._last_emitted_message = ""
         self._duplicate_message_count = 0
@@ -345,15 +349,24 @@ class AgentLoop:
                 pass
 
     def _emit_message(self, text: str):
-        if self._ui_message_cb:
-            # Deduplicate consecutive identical messages.
-            if text == self._last_emitted_message:
-                self._duplicate_message_count += 1
-                if self._duplicate_message_count > 2:
-                    return  # Suppress after 2 repeats
-            else:
-                self._duplicate_message_count = 0
-            self._last_emitted_message = text
+        # Deduplicate consecutive identical messages (both UI and debug logs).
+        suppressed = False
+        if text == self._last_emitted_message:
+            self._duplicate_message_count += 1
+            if self._duplicate_message_count > 2:
+                suppressed = True  # Suppress after 2 repeats
+        else:
+            self._duplicate_message_count = 0
+        self._last_emitted_message = text
+
+        # Ensure user-visible error/warning lines also show up in debug logs.
+        if (not suppressed) and str(text).startswith(("❌", "⛔", "⏸️")):
+            try:
+                logger.debug(text)
+            except Exception:
+                pass
+
+        if self._ui_message_cb and (not suppressed):
             try:
                 self._ui_message_cb(text)
             except Exception:
@@ -431,24 +444,6 @@ class AgentLoop:
                         assistant_message = result.message or ""
                         actions = result.actions or []
 
-                        # After ARRANGE phase, run overlap resolution on the
-                        # board so MOVE_COMPONENT actions get smart positions.
-                        if (
-                            self._orchestrator.phase == DesignPhase.ARRANGE  # type: ignore
-                            and not actions
-                            and board_snapshot.get("components")
-                            and board_snapshot.get("board_width")
-                        ):
-                            optimized = self._run_placement_optimization(
-                                board_snapshot, context
-                            )
-                            if optimized:
-                                actions = optimized
-                                assistant_message = (
-                                    "Optimizing component layout to resolve overlaps "
-                                    "and improve spacing…"
-                                )
-
                         if result.phase_complete:
                             self._emit_thinking(
                                 f"✅ Phase {phase_label} complete → "
@@ -461,6 +456,15 @@ class AgentLoop:
                             current_message, self._last_feedback
                         )
                     except Exception as e:
+                        try:
+                            from ..llm.client import LLMError
+                        except Exception:  # pragma: no cover
+                            LLMError = Exception
+                        if isinstance(e, LLMError):
+                            logger.exception("Orchestrator step failed (LLM)")
+                            self._emit_message(f"❌ LLM error: {e}")
+                            self._set_state(AgentState.ERROR)
+                            return
                         logger.exception("Orchestrator step failed; falling back to monolithic agent")
                         self._use_subagents = False  # disable for rest of loop
 
@@ -471,6 +475,17 @@ class AgentLoop:
                     subagent_msg = assistant_message  # preserve for logging
                     assistant_message = ""
                     try:
+                        # Expose phase gates to the monolithic agent so it doesn't
+                        # repeatedly propose blocked actions.
+                        context["outline_defined"] = bool(self._phase.get("outline_defined", False))
+                        # Expose board outline geometry for coordinate-aware planning.
+                        try:
+                            board_snapshot = self._build_board_snapshot(context)
+                            for k in ("board_width", "board_height", "board_origin_x", "board_origin_y", "board_center_x", "board_center_y"):
+                                if k in board_snapshot and board_snapshot.get(k) not in (None, ""):
+                                    context[k] = board_snapshot.get(k)
+                        except Exception:
+                            pass
                         # Use the phase-enhanced prompt so the monolithic
                         # agent knows what step we're on.
                         enhanced = phase_hint or current_message
@@ -516,21 +531,27 @@ class AgentLoop:
 
                 # ── Check for completion signal ──
                 if self._is_completion(assistant_message, actions):
-                    # Only allow completion if DRC actually passed or was never run
-                    if self._last_drc_passed is not False:
+                    completion_ok, reason = self._completion_requirements_met()
+                    if completion_ok:
                         self._emit_message("✅ Design process complete!")
                         self._set_state(AgentState.DONE)
                         return
+
+                    self._emit_thinking(f"⚠️ Cannot complete yet: {reason}")
+                    if self._require_full_workflow:
+                        current_message = (
+                            f"Cannot declare DESIGN_COMPLETE yet: {reason} "
+                            "Continue the board workflow: place missing components, assign nets, "
+                            "route, then run ERC and DRC again."
+                        )
                     else:
-                        # DRC hasn't passed yet — override completion and keep going
-                        self._emit_thinking("⚠️ DRC has not passed yet — continuing fixes...")
                         current_message = (
                             "DRC has NOT passed yet — you cannot declare DESIGN_COMPLETE. "
                             "Use DELETE_TRACKS to clear old routing, then MOVE_COMPONENT "
                             "to fix overlaps, then AUTOROUTE_BOARD or DRAW_TRACK to re-route, "
                             "and finally RUN_DRC again."
                         )
-                        continue
+                    continue
 
                 # ── No actions → ask the LLM to continue ──
                 if not actions:
@@ -683,9 +704,18 @@ class AgentLoop:
                 last_drc = self._find_last_drc_result(action_results)
                 if last_drc and last_drc.get("passed"):
                     self._last_drc_passed = True
-                    self._emit_message("✅ DRC passed — no errors found! Design is complete.")
-                    self._set_state(AgentState.DONE)
-                    return
+                    completion_ok, reason = self._completion_requirements_met()
+                    if completion_ok:
+                        self._emit_message("✅ DRC passed — no errors found! Design is complete.")
+                        self._set_state(AgentState.DONE)
+                        return
+                    self._emit_message(f"✅ DRC passed, but workflow is incomplete: {reason}")
+                    current_message = (
+                        f"DRC is clean but not complete: {reason}. "
+                        "Continue with the next required design phase."
+                    )
+                    self._last_feedback = current_message
+                    continue
 
                 # Track DRC failures for escalating guidance
                 if last_drc and not last_drc.get("passed"):
@@ -750,11 +780,31 @@ class AgentLoop:
         components: List[Dict[str, Any]] = []
         if pcb_data is not None:
             try:
+                # Light stats used by VerificationAgent heuristics.
+                try:
+                    snap["tracks_count"] = len(getattr(pcb_data, "tracks", []) or [])
+                    snap["vias_count"] = len(getattr(pcb_data, "vias", []) or [])
+                    snap["zones_count"] = len(getattr(pcb_data, "zones", []) or [])
+                except Exception:
+                    pass
+
                 for fp in getattr(pcb_data, "footprints", []) or []:
                     ref = str(getattr(fp, "reference", "") or "")
                     val = str(getattr(fp, "value", "") or "")
-                    x = getattr(fp, "x", 0.0)
-                    y = getattr(fp, "y", 0.0)
+                    # PCBParser.Footprint stores position in fp.at (Point in mm).
+                    x = 0.0
+                    y = 0.0
+                    try:
+                        at = getattr(fp, "at", None)
+                        if at is not None:
+                            x = float(getattr(at, "x", 0.0))
+                            y = float(getattr(at, "y", 0.0))
+                        else:
+                            x = float(getattr(fp, "x", 0.0))
+                            y = float(getattr(fp, "y", 0.0))
+                    except Exception:
+                        x = float(getattr(fp, "x", 0.0))
+                        y = float(getattr(fp, "y", 0.0))
                     w = getattr(fp, "width", 10.0)
                     h = getattr(fp, "height", 10.0)
                     components.append({
@@ -766,10 +816,156 @@ class AgentLoop:
                 pass
         snap["components"] = components
 
-        # Board dimensions.
+        # Board dimensions from context (may be missing/stale).
         snap["board_width"] = context.get("board_width")
         snap["board_height"] = context.get("board_height")
-        snap["search_part_results"] = context.get("search_part_results", {})
+
+        # If available, prefer live pcbnew board state (pcb_data can be stale
+        # during the same agent run, which causes the planner to re-add parts).
+        try:
+            import pcbnew  # type: ignore
+
+            board = context.get("board")
+            if board is None:
+                try:
+                    board = pcbnew.GetBoard()
+                except Exception:
+                    board = None
+            if board is not None:
+                live: List[Dict[str, Any]] = []
+                to_mm = getattr(pcbnew, "ToMM", None)
+                for fp in list(board.GetFootprints() or []):
+                    try:
+                        ref = str(fp.GetReference() or "")
+                    except Exception:
+                        ref = ""
+                    try:
+                        val = str(fp.GetValue() or "")
+                    except Exception:
+                        val = ""
+                    lib_id = ""
+                    try:
+                        fpid = getattr(fp, "GetFPID", None)
+                        if callable(fpid):
+                            fid = fpid()
+                            # KiCad 7/8/9: LIB_ID or FPID has several string forms.
+                            for attr in ("GetUniStringLibId", "Format", "AsString"):
+                                fn = getattr(fid, attr, None)
+                                if callable(fn):
+                                    lib_id = str(fn() or "")
+                                    if lib_id:
+                                        break
+                            if not lib_id:
+                                lib_id = str(fid) if fid is not None else ""
+                    except Exception:
+                        lib_id = ""
+                    x = y = 0.0
+                    try:
+                        pos = fp.GetPosition()
+                        if callable(to_mm):
+                            x = float(to_mm(pos.x))
+                            y = float(to_mm(pos.y))
+                    except Exception:
+                        pass
+                    live.append(
+                        {
+                            "reference": ref,
+                            "value": val,
+                            "footprint": lib_id,
+                            "x": x,
+                            "y": y,
+                            "width": 10.0,
+                            "height": 10.0,
+                        }
+                    )
+                if live:
+                    snap["components"] = live
+
+                # Board dimensions from board edges bounding box (more reliable than context keys).
+                try:
+                    bb = board.GetBoardEdgesBoundingBox()
+                    if bb is not None and callable(to_mm):
+                        w = float(to_mm(bb.GetWidth()))
+                        h = float(to_mm(bb.GetHeight()))
+                        ox = float(to_mm(bb.GetX()))
+                        oy = float(to_mm(bb.GetY()))
+                        if w > 0 and h > 0:
+                            if not snap.get("board_width") or not snap.get("board_height"):
+                                snap["board_width"] = round(w, 3)
+                                snap["board_height"] = round(h, 3)
+                            # Always capture origin/center for coordinate-aware planning.
+                            snap["board_origin_x"] = round(ox, 3)
+                            snap["board_origin_y"] = round(oy, 3)
+                            snap["board_center_x"] = round(ox + (w / 2.0), 3)
+                            snap["board_center_y"] = round(oy + (h / 2.0), 3)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # If the caller didn't provide board dimensions, attempt to compute them
+        # from pcb_data Edge.Cuts geometry so the Orchestrator can reliably
+        # detect when an outline exists.
+        if (not snap.get("board_width") or not snap.get("board_height")) and pcb_data is not None:
+            try:
+                xs: List[float] = []
+                ys: List[float] = []
+
+                def _add_pt(pt) -> None:
+                    if pt is None:
+                        return
+                    try:
+                        xs.append(float(getattr(pt, "x")))
+                        ys.append(float(getattr(pt, "y")))
+                    except Exception:
+                        pass
+
+                for ln in getattr(pcb_data, "board_outline_lines", []) or []:
+                    _add_pt(getattr(ln, "start", None))
+                    _add_pt(getattr(ln, "end", None))
+                for arc in getattr(pcb_data, "board_outline_arcs", []) or []:
+                    _add_pt(getattr(arc, "start", None))
+                    _add_pt(getattr(arc, "mid", None))
+                    _add_pt(getattr(arc, "end", None))
+                for rect in getattr(pcb_data, "board_outline_rects", []) or []:
+                    _add_pt(getattr(rect, "start", None))
+                    _add_pt(getattr(rect, "end", None))
+                for poly in getattr(pcb_data, "board_outline_polygons", []) or []:
+                    for pt in getattr(poly, "points", []) or []:
+                        _add_pt(pt)
+                for circ in getattr(pcb_data, "board_outline_circles", []) or []:
+                    c = getattr(circ, "center", None)
+                    r = float(getattr(circ, "radius", 0.0) or 0.0)
+                    if c is not None and r > 0:
+                        try:
+                            cx = float(getattr(c, "x", 0.0))
+                            cy = float(getattr(c, "y", 0.0))
+                            xs.extend([cx - r, cx + r])
+                            ys.extend([cy - r, cy + r])
+                        except Exception:
+                            pass
+
+                if xs and ys:
+                    w = max(xs) - min(xs)
+                    h = max(ys) - min(ys)
+                    if w > 0 and h > 0:
+                        snap["board_width"] = round(w, 3)
+                        snap["board_height"] = round(h, 3)
+                        snap["board_origin_x"] = round(min(xs), 3)
+                        snap["board_origin_y"] = round(min(ys), 3)
+            except Exception:
+                pass
+        raw_search = context.get("search_part_results", {})
+        if isinstance(raw_search, dict):
+            compact_search: Dict[str, Any] = {}
+            for query, items in list(raw_search.items())[-12:]:
+                if isinstance(items, list):
+                    compact_search[str(query)] = items[:6]
+                else:
+                    compact_search[str(query)] = items
+            snap["search_part_results"] = compact_search
+        else:
+            snap["search_part_results"] = {}
 
         return snap
 
@@ -803,7 +999,7 @@ class AgentLoop:
                     move_actions.append(DesignAction(
                         action_type=DesignActionType.MOVE_COMPONENT,
                         description=f"Move {ref} to ({new_x}, {new_y}) to resolve overlap",
-                        parameters={"ref": ref, "location": f"{new_x},{new_y}"},
+                        parameters={"ref": ref, "location": {"x": new_x, "y": new_y}},
                         requires_approval=True,
                     ))
 
@@ -883,28 +1079,50 @@ class AgentLoop:
                             action_results: List[str], auto: bool = False,
                             emoji: str = "🔍") -> None:
         """Execute an action, record the result, and emit status to the UI."""
-        # De-duplicate repeated SEARCH_PART loops that flood logs/context.
+        # Canonicalize parameter keys so executors see a consistent schema.
+        try:
+            action.parameters = normalize_action_parameters(action.action_type, action.parameters or {})
+        except Exception:
+            pass
+        # De-duplicate / throttle SEARCH_PART loops that flood logs/context.
         if action.action_type == DesignActionType.SEARCH_PART:
             query = ""
             try:
-                query = str(self._agent._extract_search_query(action)).strip().lower()  # type: ignore[attr-defined]
+                query = str(self._agent._extract_search_query(action)).strip()  # type: ignore[attr-defined]
             except Exception:
                 params = action.parameters or {}
                 if isinstance(params, dict):
-                    query = str(params.get("query", "") or "").strip().lower()
-            if query and query in self._seen_search_queries:
-                msg = f"Skipping duplicate SEARCH_PART query: {query}"
-                self._emit_message(f"⏭️ {msg}")
-                action_results.append(f"[SEARCH_PART] SKIPPED: {msg}")
-                return
+                    query = str(params.get("query", "") or "").strip()
+            query = self._normalize_query_key(query)
             if query:
-                self._seen_search_queries.add(query)
+                searches_this_step = sum(1 for line in action_results if line.startswith("[SEARCH_PART]"))
+                if searches_this_step >= self._max_search_actions_per_step:
+                    msg = (
+                        f"Skipping SEARCH_PART '{query}': reached per-step cap "
+                        f"({self._max_search_actions_per_step})"
+                    )
+                    self._emit_message(f"⏭️ {msg}")
+                    action_results.append(f"[SEARCH_PART] SKIPPED: {msg}")
+                    return
+
+                last_iter = self._search_query_last_iteration.get(query)
+                if last_iter is not None and (self._iteration - last_iter) <= self._search_query_cooldown_steps:
+                    msg = f"Skipping duplicate SEARCH_PART query: {query}"
+                    self._emit_message(f"⏭️ {msg}")
+                    action_results.append(f"[SEARCH_PART] SKIPPED: {msg}")
+                    return
+                self._search_query_last_iteration[query] = self._iteration
 
         # Phase gate: check prerequisites before executing
-        gate_msg = self._check_phase_gate(action)
+        gate_msg = self._check_phase_gate(action, context=context)
         if gate_msg:
             self._emit_message(f"⛔ {gate_msg}")
             action_results.append(f"[{action.action_type.name}] BLOCKED: {gate_msg}")
+            # Treat STOP gates as fatal: pause the loop and require user input
+            # rather than automatically continuing into other phases.
+            if str(gate_msg).lstrip().upper().startswith("STOP:"):
+                self._emit_message("⏸️ Pausing due to STOP condition.")
+                self.pause()
             return
 
         action.approved = True
@@ -913,6 +1131,22 @@ class AgentLoop:
 
         # Update phase tracking after execution
         self._update_phase_state(action)
+
+        # Persist verification output into context so the VerificationAgent
+        # can propose fixes rather than re-running checks blindly.
+        try:
+            if action.action_type == DesignActionType.RUN_DRC:
+                if action.success:
+                    context.pop("drc_errors", None)
+                else:
+                    context["drc_errors"] = action.result_message or ""
+            elif action.action_type == DesignActionType.RUN_ERC:
+                if action.success:
+                    context.pop("erc_errors", None)
+                else:
+                    context["erc_errors"] = action.result_message or ""
+        except Exception:
+            pass
 
         self._history.append(LoopStep(
             iteration=self._iteration,
@@ -1003,9 +1237,57 @@ class AgentLoop:
         """Return True if the action type modifies the board."""
         return action_type in DESTRUCTIVE_ACTIONS
 
+    @staticmethod
+    def _goal_requires_full_workflow(goal: str) -> bool:
+        text = str(goal or "").strip().lower()
+        if not text:
+            return False
+        if any(k in text for k in ("from scratch", "full board", "complete board", "entire board")):
+            return True
+        has_build_intent = bool(re.search(r"\b(build|design|create)\b", text))
+        has_board_target = bool(re.search(r"\b(pcb|board|carrier|breakout|shield|module)\b", text))
+        has_narrow_action = bool(re.search(
+            r"\b(add|place|move|rotate|outline|route|run drc|run erc|delete|search)\b", text
+        ))
+        return has_build_intent and has_board_target and not has_narrow_action
+
+    def _completion_requirements_met(self) -> Tuple[bool, str]:
+        if self._require_full_workflow:
+            if self._last_drc_passed is not True:
+                return False, "DRC has not passed yet"
+            if not self._phase.get("outline_defined"):
+                return False, "board outline is not defined"
+            goal_text = str(self._goal or "").lower()
+            min_components = 5 if any(
+                k in goal_text for k in ("from scratch", "full board", "complete board", "entire board")
+            ) else 3
+            if int(self._phase.get("components_placed", 0)) < min_components:
+                return False, (
+                    f"only {self._phase.get('components_placed', 0)} component(s) placed "
+                    f"(need at least {min_components})"
+                )
+            if int(self._phase.get("nets_assigned", 0)) <= 0:
+                return False, "nets have not been assigned"
+            if not self._phase.get("routing_attempted"):
+                return False, "routing has not been attempted"
+            return True, ""
+
+        if self._last_drc_passed is False:
+            return False, "DRC has not passed yet"
+        return True, ""
+
+    @staticmethod
+    def _normalize_query_key(value: str) -> str:
+        text = str(value or "").strip().lower()
+        if not text:
+            return ""
+        text = re.sub(r"\s+", " ", text)
+        text = re.sub(r"\s*:\s*", ":", text)
+        return text
+
     # ── Phase-gate logic ─────────────────────────────────────────
 
-    def _check_phase_gate(self, action: DesignAction) -> Optional[str]:
+    def _check_phase_gate(self, action: DesignAction, context: Optional[Dict[str, Any]] = None) -> Optional[str]:
         """Check if an action's prerequisites are met.
 
         Returns None if the action is allowed, or a feedback string to inject
@@ -1013,6 +1295,14 @@ class AgentLoop:
         """
         at = action.action_type
         params = getattr(action, 'parameters', None) or {}
+        context = context or {}
+
+        if at == DesignActionType.DEFINE_BOARD_OUTLINE:
+            if self._phase.get("outline_defined"):
+                return (
+                    "Board outline is already defined. Do not DEFINE_BOARD_OUTLINE again "
+                    "unless the user explicitly asked to change dimensions."
+                )
 
         # ── Death-loop detection: block repeated add/delete cycles ──
         if at == DesignActionType.ADD_COMPONENT:
@@ -1020,13 +1310,13 @@ class AgentLoop:
             for key in ('query', 'part_name', 'mpn', 'part', 'name'):
                 v = params.get(key)
                 if isinstance(v, str) and v.strip():
-                    query = v.strip().lower()
+                    query = self._normalize_query_key(v)
                     break
             if query:
-                count = self._component_add_count.get(query, 0)
+                count = self._component_add_fail_count.get(query, 0)
                 if count >= 3:
                     return (
-                        f"STOP: already tried to add '{query}' {count} times. "
+                        f"STOP: '{query}' failed to add {count} times. "
                         "The correct footprint may not be available. "
                         "Skip this component and move on to the next design phase."
                     )
@@ -1035,8 +1325,81 @@ class AgentLoop:
                 return (
                     "STOP: the last 5 component placements failed due to footprint loading errors. "
                     "The pcbnew library state may be unstable. "
-                    "Proceed to DEFINE_BOARD_OUTLINE or net assignment with the components already on the board."
-                )
+                        "Proceed to DEFINE_BOARD_OUTLINE or net assignment with the components already on the board."
+                    )
+
+            # Duplicate placement guard: if the exact footprint is already present,
+            # block re-adding it (except for common multi-instance footprints).
+            try:
+                qn = self._normalize_query_key(query)
+            except Exception:
+                qn = ''
+            multi_ok = False
+            if qn:
+                # Allow many instances of passives and mechanicals.
+                if re.match(r"^(r_|c_|l_)", qn):
+                    multi_ok = True
+                if any(k in qn for k in ("mountinghole", "fiducial", "testpoint")):
+                    multi_ok = True
+            if qn and not multi_ok:
+                existing: List[str] = []
+                # Prefer live pcbnew board.
+                try:
+                    import pcbnew  # type: ignore
+
+                    board = context.get("board")
+                    if board is None:
+                        board = pcbnew.GetBoard()
+                    for fp in list(board.GetFootprints() or []):
+                        try:
+                            fpid = getattr(fp, "GetFPID", None)
+                            lib_id = ""
+                            if callable(fpid):
+                                fid = fpid()
+                                for attr in ("GetUniStringLibId", "Format", "AsString"):
+                                    fn = getattr(fid, attr, None)
+                                    if callable(fn):
+                                        lib_id = str(fn() or "")
+                                        if lib_id:
+                                            break
+                                if not lib_id:
+                                    lib_id = str(fid) if fid is not None else ""
+                            if lib_id:
+                                existing.append(self._normalize_query_key(lib_id))
+                        except Exception:
+                            continue
+                except Exception:
+                    existing = []
+                # Fallback to pcb_data if provided.
+                if not existing:
+                    try:
+                        pcb_data = context.get("pcb_data")
+                        for fp in getattr(pcb_data, "footprints", []) or []:
+                            lib = str(getattr(fp, "library", "") or "").strip()
+                            name = str(getattr(fp, "footprint_name", "") or "").strip()
+                            if lib and name:
+                                existing.append(self._normalize_query_key(f"{lib}:{name}"))
+                    except Exception:
+                        pass
+
+                def _matches_existing(q: str, e: str) -> bool:
+                    if not q or not e:
+                        return False
+                    if q == e:
+                        return True
+                    # If query omits library, match by suffix.
+                    if ":" not in q and e.endswith(":" + q):
+                        return True
+                    # As a last resort, token containment (avoid tiny strings).
+                    if len(q) >= 8 and q in e:
+                        return True
+                    return False
+
+                if any(_matches_existing(qn, e) for e in existing):
+                    return (
+                        f"Duplicate ADD_COMPONENT blocked: footprint '{query}' already exists on the board. "
+                        "Use MOVE_COMPONENT/ROTATE_COMPONENT to adjust placement, or specify explicitly if you need multiple instances."
+                    )
 
         if at == DesignActionType.DELETE_COMPONENT:
             ref = ''
@@ -1087,6 +1450,11 @@ class AgentLoop:
                     "DRC needs a board outline to check edge clearances. "
                     "Use DEFINE_BOARD_OUTLINE first."
                 )
+            if self._require_full_workflow and self._phase.get('nets_assigned', 0) <= 0:
+                return (
+                    "Cannot RUN_DRC yet: no nets are assigned. "
+                    "Run DEFINE_NET/ASSIGN_NETS first, then RUN_ERC, then RUN_DRC."
+                )
 
         return None  # action is allowed
 
@@ -1100,21 +1468,30 @@ class AgentLoop:
         params = getattr(action, 'parameters', None) or {}
 
         if at == DesignActionType.ADD_COMPONENT:
-            # Track add attempts per query (for death-loop detection)
+            # Track add failures per query (for death-loop detection)
             query = ''
             for key in ('query', 'part_name', 'mpn', 'part', 'name'):
                 v = params.get(key)
                 if isinstance(v, str) and v.strip():
-                    query = v.strip().lower()
+                    query = self._normalize_query_key(v)
                     break
-            if query:
-                self._component_add_count[query] = self._component_add_count.get(query, 0) + 1
             # Track consecutive footprint failures
             if ok:
                 self._phase['components_placed'] = self._phase.get('components_placed', 0) + 1
                 self._consecutive_fp_failures = 0  # reset on success
-            elif 'failed to load footprint' in msg or 'no footprint found' in msg:
-                self._consecutive_fp_failures += 1
+                if query:
+                    self._component_add_fail_count.pop(query, None)
+            else:
+                if any(s in msg for s in (
+                    'failed to load footprint',
+                    'no footprint found',
+                    'cannot read footprint',
+                    'footprint file does not exist',
+                    'rejected footprint',
+                )):
+                    self._consecutive_fp_failures += 1
+                    if query:
+                        self._component_add_fail_count[query] = self._component_add_fail_count.get(query, 0) + 1
 
         elif at == DesignActionType.DELETE_COMPONENT:
             ref = ''

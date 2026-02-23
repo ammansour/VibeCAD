@@ -2,11 +2,9 @@
 
 Goal: avoid starting the autonomous AgentLoop for simple informational Q&A.
 
-This module intentionally avoids complex heuristics. Primary routing is done via
-an LLM classification call. When the LLM is not available, it falls back to a
-minimal, deterministic rule:
-- message ending with '?' => Q&A
-- otherwise => AgentLoop
+Primary routing is done via an LLM classification call. If the LLM is not
+available or returns an invalid response, routing fails fast (no deterministic
+fallbacks).
 """
 
 from __future__ import annotations
@@ -40,13 +38,6 @@ _SYSTEM_PROMPT = (
 )
 
 
-def _minimal_fallback(message: str) -> IntentDecision:
-    text = (message or "").strip()
-    if text.endswith("?"):
-        return IntentDecision(route="qa", reason="fallback:question_mark")
-    return IntentDecision(route="agent", reason="fallback:default")
-
-
 def _extract_json_object(text: str) -> Optional[dict]:
     if not text:
         return None
@@ -65,8 +56,10 @@ def _extract_json_object(text: str) -> Optional[dict]:
 def decide_route(llm_client: Optional[LLMClientLike], message: str) -> IntentDecision:
     """Decide whether to route the message to Q&A or AgentLoop."""
 
+    from vibecad.llm.client import LLMError
+
     if llm_client is None or not getattr(llm_client, "is_available", False):
-        return _minimal_fallback(message)
+        raise LLMError("LLM is required for intent routing but is not available/configured.")
 
     try:
         from vibecad.llm.client import LLMMessage
@@ -78,16 +71,18 @@ def decide_route(llm_client: Optional[LLMClientLike], message: str) -> IntentDec
         raw = (getattr(resp, "content", "") or "").strip()
         parsed = _extract_json_object(raw)
         if not parsed:
-            return _minimal_fallback(message)
+            raise LLMError("Intent router returned invalid/empty JSON.")
 
         route = str(parsed.get("route", "")).strip().lower()
         reason = str(parsed.get("reason", "")).strip()[:240]
         if route not in ("qa", "agent"):
-            return _minimal_fallback(message)
+            raise LLMError(f"Intent router returned invalid route: {route!r}")
 
         return IntentDecision(route=route, reason=reason or "llm")
-    except Exception:
-        return _minimal_fallback(message)
+    except LLMError:
+        raise
+    except Exception as e:
+        raise LLMError(f"Intent routing failed: {e}") from e
 
 
 def should_route_to_qa(llm_client: Optional[LLMClientLike], message: str) -> bool:

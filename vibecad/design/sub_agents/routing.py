@@ -23,27 +23,17 @@ class RoutingAgent(SubAgent):
     NAME = "routing"
 
     SYSTEM_PROMPT = (
-        "You are the Routing sub-agent of VibeCAD.\n\n"
-        "Your ONLY job is to assign nets to pads and route copper traces.\n"
-        "Available actions: DEFINE_NET, ASSIGN_NETS, DRAW_TRACK, ADD_VIA, "
-        "AUTOROUTE_BOARD, SET_LAYER_COUNT, DELETE_TRACKS.\n\n"
-        "Strategy:\n"
-        "1. Before any routing, ensure ALL pads have nets assigned.\n"
-        "   - Use DEFINE_NET for logical connections (e.g. GND, VCC, SDA).\n"
-        "   - Use ASSIGN_NETS for bulk pad-to-net mapping.\n"
-        "2. If pad assignments report 'pad not found', the footprint has the\n"
-        "   wrong pin count.  Report this — do NOT proceed to routing.\n"
-        "3. For routing: prefer AUTOROUTE_BOARD when ≥ 5 nets need routing.\n"
-        "   Use DRAW_TRACK for individual critical nets (short, matched-length).\n"
-        "4. If the autorouter reports unrouted nets, try DELETE_TRACKS then\n"
-        "   re-route after verifying net assignments are correct.\n"
-        "5. Use SET_LAYER_COUNT if the board needs more than 2 layers.\n\n"
-        "Routing rules:\n"
-        "- All tracks follow cardinal (H/V) or 45° directions.\n"
-        "- Default track width: 0.25 mm (signal), 0.5 mm (power).\n"
-        "- Never invent coordinates.  Use ref/pad notation (e.g. U1/14).\n\n"
-        "CRITICAL: Never propose placement, search, or verification actions.\n\n"
-        "Return ONLY a JSON array of actions.\n"
+        "You are the Routing sub-agent.\n"
+        "Only propose: DEFINE_NET, ASSIGN_NETS, DRAW_TRACK, ADD_VIA, AUTOROUTE_BOARD, SET_LAYER_COUNT, DELETE_TRACKS.\n"
+        "Assign nets before routing. If pad-not-found appears, do not route.\n"
+        "Prefer AUTOROUTE_BOARD for many nets; use DRAW_TRACK for specific nets.\n"
+        "Use ref/pad notation instead of invented coordinates.\n"
+        "Parameter schema (use exactly these keys):\n"
+        "- DEFINE_NET.parameters = {\"net\":\"GND\",\"pads\":[\"U1:3\",\"J1:4\"]} (pads optional)\n"
+        "- ASSIGN_NETS.parameters = {\"assignments\":[{\"net\":\"GND\",\"ref\":\"U1\",\"pad\":\"3\"}, ...]}\n"
+        "- DRAW_TRACK.parameters = {\"from_point\":\"U1/3\",\"to_point\":\"J1/4\"}\n"
+        "Never propose placement/search/verification actions.\n"
+        "Return JSON array only.\n"
     )
 
     def __init__(self, llm_client=None):
@@ -71,22 +61,21 @@ class RoutingAgent(SubAgent):
     ) -> SubAgentResult:
         from ..design_agent import DesignAction, DesignActionType
 
-        if self._llm_available():
-            raw = self._llm_chat(self._build_prompt(goal, context, board_snapshot))
-            actions = self._parse_actions(raw)
-            if actions:
-                return SubAgentResult(
-                    message=f"Proposing {len(actions)} routing/net-assignment action(s).",
-                    actions=actions,
-                    confidence=0.85,
-                    thinking=f"LLM proposed {len(actions)} routing actions",
-                )
+        raw = self._llm_chat(self._build_prompt(goal, context, board_snapshot))
+        actions = self._parse_actions(raw)
+        if actions:
+            return SubAgentResult(
+                message=f"Proposing {len(actions)} routing/net-assignment action(s).",
+                actions=actions,
+                confidence=0.85,
+                thinking=f"LLM proposed {len(actions)} routing actions",
+            )
 
-        # Minimal fallback: if pads have no nets, suggest AUTOROUTE_BOARD.
         return SubAgentResult(
-            message="Could not generate routing actions. Ensure nets are assigned first.",
-            confidence=0.2,
-            phase_complete=True,  # Don't get stuck — let orchestrator advance
+            message="No routing/net-assignment actions proposed.",
+            confidence=0.3,
+            phase_complete=False,
+            thinking="LLM proposed no routing actions",
         )
 
     # ── Internal ────────────────────────────────────────────────
@@ -117,16 +106,19 @@ class RoutingAgent(SubAgent):
 
     def _parse_actions(self, raw: str) -> list:
         from ..design_agent import DesignAction, DesignActionType
+        from ...llm.client import LLMError
         if not raw:
-            return []
+            raise LLMError("routing: empty LLM response.")
         try:
             start = raw.find("[")
             end = raw.rfind("]") + 1
             if start < 0 or end <= start:
-                return []
+                raise LLMError("routing: expected a JSON array.")
             items = json.loads(raw[start:end])
-        except Exception:
-            return []
+        except LLMError:
+            raise
+        except Exception as e:
+            raise LLMError(f"routing: failed to parse JSON array: {e}") from e
 
         type_map = {
             "DEFINE_NET": DesignActionType.DEFINE_NET,
@@ -147,10 +139,13 @@ class RoutingAgent(SubAgent):
             atype = type_map.get(atype_str)
             if atype is None:
                 continue
+            params = item.get("parameters") or {}
+            if not isinstance(params, dict):
+                raise LLMError(f"routing: parameters must be an object for {atype.name}.")
             actions.append(DesignAction(
                 action_type=atype,
                 description=str(item.get("description", "")),
-                parameters=item.get("parameters") or {},
+                parameters=params,
                 requires_approval=True,
             ))
         return actions

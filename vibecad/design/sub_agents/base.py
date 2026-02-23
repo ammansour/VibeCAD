@@ -95,15 +95,21 @@ class SubAgent:
 
     def _llm_chat(self, user_prompt: str, system_prompt: Optional[str] = None) -> str:
         """Convenience wrapper around the shared LLM client."""
+        from ...llm.client import LLMError
         if not self._llm_available():
-            return ""
+            raise LLMError(f"{self.NAME}: LLM is required but is not available/configured.")
         try:
             from ...llm.client import LLMMessage
             resp = self._llm_client.chat(
                 [LLMMessage(role="user", content=user_prompt)],
                 system_prompt=system_prompt or self.SYSTEM_PROMPT,
             )
-            return (getattr(resp, "content", "") or "").strip()
-        except Exception:
-            logger.exception(f"{self.NAME}: LLM call failed")
-            return ""
+            content = (getattr(resp, "content", "") or "").strip()
+            if not content:
+                raise LLMError(f"{self.NAME}: LLM returned empty content.")
+            return content
+        except LLMError:
+            raise
+        except Exception as e:
+            logger.exception("%s: LLM call failed", self.NAME)
+            raise LLMError(f"{self.NAME}: LLM call failed: {e}") from e

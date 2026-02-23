@@ -43,127 +43,14 @@ class LibrarySource(Enum):
     EASYEDA = "easyeda"              # Free, keyless LCSC/EasyEDA Pro search API
 
 
-# Map lowercase part-name prefixes to KiCad official symbol library names.
-# Used to decide which library page on kicad.github.io to check.
-KICAD_LIB_PREFIXES: Dict[str, List[str]] = {
-    'ads':     ['Analog_ADC'],
-    'mcp':     ['Analog_ADC', 'Analog_DAC'],
-    'max':     ['Analog', 'Analog_ADC', 'Interface'],
-    'ina':     ['Analog'],
-    'pic16':   ['MCU_Microchip_PIC16'],
-    'pic18':   ['MCU_Microchip_PIC18'],
-    'pic32':   ['MCU_Microchip_PIC32'],
-    'dspic':   ['MCU_Microchip_dsPIC'],
-    'stm32':   ['MCU_ST_STM32'],
-    'stm8':    ['MCU_ST_STM8'],
-    'esp32':   ['MCU_Espressif_ESP32'],
-    'nrf51':   ['MCU_Nordic'],
-    'nrf52':   ['MCU_Nordic'],
-    'nrf53':   ['MCU_Nordic'],
-    'lpc':     ['MCU_NXP_LPC'],
-    'kinetis': ['MCU_NXP_Kinetis'],
-    'rp2040':  ['MCU_RaspberryPi_and_Boards'],
-    'ne555':   ['Timer'],
-    'lm555':   ['Timer'],
-    'lm78':    ['Regulator_Linear'],
-    'lm79':    ['Regulator_Linear'],
-    'lm317':   ['Regulator_Linear'],
-    'ld111':   ['Regulator_Linear'],
-    '74hc':    ['74xx'],
-    '74ls':    ['74xx'],
-    '74ahc':   ['74xx'],
-}
-
-# Keyword-based library mapping for broader queries (component types,
-# manufacturer names, etc.).  Used when prefix matching fails.
-KICAD_LIB_KEYWORDS: Dict[str, List[str]] = {
-    # Component types
-    'battery':      ['Battery'],
-    'cell':         ['Battery'],
-    'connector':    ['Connector', 'Connector_Generic'],
-    'header':       ['Connector_PinHeader', 'Connector_PinSocket'],
-    'pin_header':   ['Connector_PinHeader'],
-    'usb':          ['Connector_USB'],
-    'hdmi':         ['Connector_HDMI'],
-    'audio':        ['Connector_Audio'],
-    'barrel':       ['Connector_BarrelJack'],
-    'rj45':         ['Connector_RJ'],
-    'sd_card':      ['Connector_Card'],
-    'led':          ['LED'],
-    'diode':        ['Diode', 'Diode_Bridge'],
-    'zener':        ['Diode'],
-    'schottky':     ['Diode'],
-    'transistor':   ['Transistor_BJT', 'Transistor_FET'],
-    'mosfet':       ['Transistor_FET'],
-    'jfet':         ['Transistor_FET'],
-    'bjt':          ['Transistor_BJT'],
-    'igbt':         ['Transistor_IGBT'],
-    'opamp':        ['Amplifier_Operational'],
-    'op-amp':       ['Amplifier_Operational'],
-    'amplifier':    ['Amplifier_Operational', 'Amplifier_Audio'],
-    'comparator':   ['Comparator'],
-    'sensor':       ['Sensor', 'Sensor_Temperature', 'Sensor_Humidity'],
-    'temperature':  ['Sensor_Temperature'],
-    'accelerometer': ['Sensor_Motion'],
-    'gyro':         ['Sensor_Motion'],
-    'relay':        ['Relay', 'Relay_SolidState'],
-    'switch':       ['Switch'],
-    'button':       ['Switch'],
-    'crystal':      ['Device'],
-    'oscillator':   ['Oscillator'],
-    'timer':        ['Timer'],
-    'resistor':     ['Device'],
-    'capacitor':    ['Device'],
-    'inductor':     ['Device'],
-    'fuse':         ['Device'],
-    'ferrite':      ['Device'],
-    'motor':        ['Motor'],
-    'driver':       ['Motor', 'Driver_Motor'],
-    'display':      ['Display_Character', 'Display_Graphic'],
-    'oled':         ['Display_Graphic'],
-    'lcd':          ['Display_Character', 'Display_Graphic'],
-    'eeprom':       ['Memory_EEPROM'],
-    'flash':        ['Memory_Flash'],
-    'sram':         ['Memory_RAM'],
-    'regulator':    ['Regulator_Linear', 'Regulator_Switching'],
-    'ldo':          ['Regulator_Linear'],
-    'dcdc':         ['Regulator_Switching'],
-    'buck':         ['Regulator_Switching'],
-    'boost':        ['Regulator_Switching'],
-    'power':        ['Power_Management', 'Power_Protection'],
-    'adc':          ['Analog_ADC'],
-    'dac':          ['Analog_DAC'],
-    'interface':    ['Interface', 'Interface_UART', 'Interface_USB'],
-    'uart':         ['Interface_UART'],
-    'spi':          ['Interface_SPI'],
-    'i2c':          ['Interface_I2C'],
-    'can':          ['Interface_CAN'],
-    'ethernet':     ['Interface_Ethernet'],
-    'rf':           ['RF', 'RF_Module'],
-    'wifi':         ['RF_Module'],
-    'bluetooth':    ['RF_Bluetooth'],
-    'ble':          ['RF_Bluetooth'],
-    'lora':         ['RF_Module'],
-    'transformer':  ['Transformer'],
-    'optocoupler':  ['Isolator'],
-    'isolator':     ['Isolator'],
-    'triac':        ['Triac_Thyristor'],
-    'thyristor':    ['Triac_Thyristor'],
-    'potentiometer': ['Device'],
-    'mounting':     ['Mechanical'],
-    'testpoint':    ['TestPoint'],
-    'fiducial':     ['Fiducial'],
-    # Manufacturer names → likely library categories
-    'keystone':     ['Battery', 'TestPoint'],
-    'molex':        ['Connector_Molex'],
-    'jst':          ['Connector_JST'],
-    'hirose':       ['Connector_Hirose'],
-    'amphenol':     ['Connector'],
-    'samtec':       ['Connector'],
-    'wurth':        ['Connector', 'Inductor_THT', 'Inductor_SMD'],
-    'phoenix':      ['Connector_Phoenix_MC', 'Connector_Phoenix_MSTB'],
-    'wago':         ['Connector_Wago'],
-}
+#
+# Deterministic keyword/prefix library guessing has been disabled.
+# It can hide correct matches when the guess is wrong. We prefer a global
+# local search, and let the LLM drive specificity via SEARCH_PART and
+# explicit "Lib:Footprint" identifiers.
+#
+KICAD_LIB_PREFIXES: Dict[str, List[str]] = {}
+KICAD_LIB_KEYWORDS: Dict[str, List[str]] = {}
 
 
 @dataclass
@@ -1061,6 +948,51 @@ class LibraryManager:
         # GitHub search API max per_page is 100; keep small.
         per_page = min(max(int(limit), 1), 20)
 
+        def _looks_like_cert_error(exc: Exception) -> bool:
+            # SSLCertVerificationError, SSLError, or URLError wrapping one.
+            try:
+                if isinstance(exc, ssl.SSLCertVerificationError):
+                    return True
+            except Exception:
+                pass
+            try:
+                reason = getattr(exc, 'reason', None)
+                if reason is not None:
+                    if isinstance(reason, ssl.SSLCertVerificationError):
+                        return True
+                    if isinstance(reason, ssl.SSLError) and 'CERTIFICATE_VERIFY_FAILED' in str(reason):
+                        return True
+            except Exception:
+                pass
+            return 'CERTIFICATE_VERIFY_FAILED' in str(exc)
+
+        def _ssl_contexts() -> Tuple[Optional[ssl.SSLContext], Optional[ssl.SSLContext]]:
+            cafile = (
+                os.environ.get("VIBECAD_CA_BUNDLE", "").strip()
+                or os.environ.get("REQUESTS_CA_BUNDLE", "").strip()
+                or os.environ.get("SSL_CERT_FILE", "").strip()
+            )
+            if not cafile:
+                try:
+                    import certifi  # type: ignore
+
+                    cafile = certifi.where() or ""
+                except Exception:
+                    cafile = ""
+            verified: Optional[ssl.SSLContext]
+            try:
+                verified = ssl.create_default_context(cafile=cafile) if cafile else ssl.create_default_context()
+            except Exception:
+                verified = None
+            try:
+                unverified = ssl._create_unverified_context()
+            except Exception:
+                unverified = None
+            return verified, unverified
+
+        verified_ctx, unverified_ctx = _ssl_contexts()
+        allow_insecure = bool(os.environ.get("VIBECAD_SSL_NO_VERIFY", "").strip())
+
         def _fetch(kind: str) -> List[Dict[str, Any]]:
             # kind: 'kicad_mod' or 'kicad_sym'
             api = 'https://api.github.com/search/code'
@@ -1076,8 +1008,21 @@ class LibraryManager:
             if tok:
                 headers['Authorization'] = f"Bearer {tok}"
             req = Request(url, headers=headers)
-            with urlopen(req, timeout=15) as resp:
-                return json.loads(resp.read().decode('utf-8')).get('items', [])
+            try:
+                if verified_ctx is None:
+                    with urlopen(req, timeout=15) as resp:
+                        return json.loads(resp.read().decode('utf-8')).get('items', [])
+                with urlopen(req, timeout=15, context=verified_ctx) as resp:
+                    return json.loads(resp.read().decode('utf-8')).get('items', [])
+            except Exception as exc:
+                if allow_insecure and unverified_ctx is not None and _looks_like_cert_error(exc):
+                    logger.warning(
+                        "GitHub search API used unverified SSL context (cert verify failed). "
+                        "Set VIBECAD_CA_BUNDLE/SSL_CERT_FILE or install certifi to avoid this."
+                    )
+                    with urlopen(req, timeout=15, context=unverified_ctx) as resp:
+                        return json.loads(resp.read().decode('utf-8')).get('items', [])
+                raise
 
         try:
             items_mod = _fetch('kicad_mod')
@@ -1834,33 +1779,18 @@ class LibraryManager:
             if vt != tokens:
                 extra_tokens_sets.append(vt)
 
-        preferred_libs = self._guess_kicad_libraries(query)
-
-        def _score_entries(only_libs: Optional[set]) -> List[Tuple[float, int, Tuple[str, str, str, str, Optional[str]]]]:
-            scored_local: List[Tuple[float, int, Tuple[str, str, str, str, Optional[str]]]] = []
-            for idx, entry in enumerate(index):
-                name_lower, name, lib, etype, file_path = entry
-                if only_libs is not None and lib not in only_libs:
-                    continue
-                score = self._score_match(name_lower, tokens)
-                # Try alternative token sets and keep the best score
-                for alt in extra_tokens_sets:
-                    alt_score = self._score_match(name_lower, alt)
-                    if alt_score > score:
-                        score = alt_score
-                if score > 0:
-                    scored_local.append((score, idx, entry))
-            return scored_local
-
-        # Score every entry, optionally filtered to likely libraries.
+        # Score every entry globally (no deterministic keyword/prefix filtering).
         scored: List[Tuple[float, int, Tuple[str, str, str, str, Optional[str]]]] = []
-        if preferred_libs:
-            scored = _score_entries(set(preferred_libs))
-            # If filtering is too restrictive, fall back to global search.
-            if len(scored) < max(3, min(int(limit), 10) // 2):
-                scored = _score_entries(None)
-        else:
-            scored = _score_entries(None)
+        for idx, entry in enumerate(index):
+            name_lower, name, lib, etype, file_path = entry
+            score = self._score_match(name_lower, tokens)
+            # Try alternative token sets and keep the best score
+            for alt in extra_tokens_sets:
+                alt_score = self._score_match(name_lower, alt)
+                if alt_score > score:
+                    score = alt_score
+            if score > 0:
+                scored.append((score, idx, entry))
 
         if not scored:
             return []
@@ -1904,29 +1834,11 @@ class LibraryManager:
     def _guess_kicad_libraries(self, query: str) -> List[str]:
         """Return candidate KiCad library names for a query.
 
-        Checks prefix map first (exact MPN prefixes like ``stm32``),
-        then falls back to keyword matching (component types and
-        manufacturer names like ``battery``, ``keystone``).
+        Deterministic keyword/prefix guessing is intentionally disabled. If you
+        want to constrain the search, have the LLM provide an explicit
+        "LibName:SymbolName" or "LibName:FootprintName" identifier instead.
         """
-        q = query.strip().lower()
-
-        # 1. Prefix match (original behaviour — great for exact MPNs)
-        for prefix, libs in KICAD_LIB_PREFIXES.items():
-            if q.startswith(prefix):
-                return list(libs)
-
-        # 2. Keyword/token match (broader — handles categories & mfg names)
-        tokens = self._tokenize_query(query)
-        candidates: List[str] = []
-        seen: set = set()
-        for token in tokens:
-            for keyword, libs in KICAD_LIB_KEYWORDS.items():
-                if token == keyword or keyword.startswith(token) or token.startswith(keyword):
-                    for lib in libs:
-                        if lib not in seen:
-                            seen.add(lib)
-                            candidates.append(lib)
-        return candidates
+        return []
 
     # ------------------------------------------------------------------
     # KiCad built-in library search (kicad.github.io)
@@ -2090,9 +2002,64 @@ class LibraryManager:
                 headers['Authorization'] = f'Token {self.snapeda_api_key}'
             
             request = Request(url, headers=headers)
-            
-            with urlopen(request, timeout=15) as response:
-                data = json.loads(response.read().decode('utf-8'))
+
+            def _looks_like_cert_error(exc: Exception) -> bool:
+                try:
+                    if isinstance(exc, ssl.SSLCertVerificationError):
+                        return True
+                except Exception:
+                    pass
+                try:
+                    reason = getattr(exc, 'reason', None)
+                    if reason is not None:
+                        if isinstance(reason, ssl.SSLCertVerificationError):
+                            return True
+                        if isinstance(reason, ssl.SSLError) and 'CERTIFICATE_VERIFY_FAILED' in str(reason):
+                            return True
+                except Exception:
+                    pass
+                return 'CERTIFICATE_VERIFY_FAILED' in str(exc)
+
+            cafile = (
+                os.environ.get("VIBECAD_CA_BUNDLE", "").strip()
+                or os.environ.get("REQUESTS_CA_BUNDLE", "").strip()
+                or os.environ.get("SSL_CERT_FILE", "").strip()
+            )
+            if not cafile:
+                try:
+                    import certifi  # type: ignore
+
+                    cafile = certifi.where() or ""
+                except Exception:
+                    cafile = ""
+            verified_ctx: Optional[ssl.SSLContext]
+            try:
+                verified_ctx = ssl.create_default_context(cafile=cafile) if cafile else ssl.create_default_context()
+            except Exception:
+                verified_ctx = None
+            try:
+                unverified_ctx = ssl._create_unverified_context()
+            except Exception:
+                unverified_ctx = None
+            allow_insecure = bool(os.environ.get("VIBECAD_SSL_NO_VERIFY", "").strip())
+
+            try:
+                if verified_ctx is None:
+                    with urlopen(request, timeout=15) as response:
+                        data = json.loads(response.read().decode('utf-8'))
+                else:
+                    with urlopen(request, timeout=15, context=verified_ctx) as response:
+                        data = json.loads(response.read().decode('utf-8'))
+            except Exception as exc:
+                if allow_insecure and unverified_ctx is not None and _looks_like_cert_error(exc):
+                    logger.warning(
+                        "SnapEDA search used unverified SSL context (cert verify failed). "
+                        "Set VIBECAD_CA_BUNDLE/SSL_CERT_FILE or install certifi to avoid this."
+                    )
+                    with urlopen(request, timeout=15, context=unverified_ctx) as response:
+                        data = json.loads(response.read().decode('utf-8'))
+                else:
+                    raise
 
             # SnapEDA returns {"error": "not logged in"} without auth
             if data.get('error'):

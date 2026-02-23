@@ -323,6 +323,89 @@ class TestPreflightActions(unittest.TestCase):
             self.assertIn("package", msg.lower(),
                           "If dropped, should ask for package info")
 
+    def test_preflight_normalizes_define_net_net_name(self):
+        from vibecad.design.design_agent import DesignAgent, DesignAction, DesignActionType
+
+        agent = DesignAgent()
+        agent._library_manager = self._mgr
+
+        action = DesignAction(
+            action_type=DesignActionType.DEFINE_NET,
+            description="Define the GND net",
+            parameters={"net_name": "GND"},
+            requires_approval=False,
+        )
+        msg, actions = agent._preflight_actions("OK", [action], {})
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0].parameters.get("net"), "GND")
+
+    def test_preflight_splits_define_net_net_names(self):
+        from vibecad.design.design_agent import DesignAgent, DesignAction, DesignActionType
+
+        agent = DesignAgent()
+        agent._library_manager = self._mgr
+
+        action = DesignAction(
+            action_type=DesignActionType.DEFINE_NET,
+            description="Define primary power nets",
+            parameters={"net_names": ["GND", "+5V", "VIN"]},
+            requires_approval=False,
+        )
+        msg, actions = agent._preflight_actions("OK", [action], {})
+        nets = [a.parameters.get("net") for a in actions]
+        self.assertEqual(nets, ["GND", "+5V", "VIN"])
+
+    def test_preflight_normalizes_assign_nets_net_assignments_pin_ref(self):
+        from vibecad.design.design_agent import DesignAgent, DesignAction, DesignActionType
+
+        agent = DesignAgent()
+        agent._library_manager = self._mgr
+
+        action = DesignAction(
+            action_type=DesignActionType.ASSIGN_NETS,
+            description="Assign GND to U1 pin 1",
+            parameters={
+                "net_assignments": [
+                    {"net_name": "GND", "pin_ref": "U1-1"},
+                    {"net_name": "+5V", "pin_references": ["U1:2", "J1/1"]},
+                ]
+            },
+            requires_approval=False,
+        )
+        msg, actions = agent._preflight_actions("OK", [action], {})
+        self.assertEqual(len(actions), 1)
+        assigns = actions[0].parameters.get("assignments")
+        self.assertIsInstance(assigns, list)
+        self.assertIn({"net": "GND", "ref": "U1", "pad": "1"}, assigns)
+        self.assertIn({"net": "+5V", "ref": "U1", "pad": "2"}, assigns)
+        self.assertIn({"net": "+5V", "ref": "J1", "pad": "1"}, assigns)
+
+    def test_preflight_normalizes_assign_nets_grouped_pads(self):
+        from vibecad.design.design_agent import DesignAgent, DesignAction, DesignActionType
+
+        agent = DesignAgent()
+        agent._library_manager = self._mgr
+
+        action = DesignAction(
+            action_type=DesignActionType.ASSIGN_NETS,
+            description="Assign power nets",
+            parameters={
+                "net_assignments": [
+                    {"net_name": "GND", "pads": ["U3/8", "C1/2"]},
+                    {"net_name": "+5V", "pads": ["U3/7", "C1/1"]},
+                ]
+            },
+            requires_approval=False,
+        )
+        msg, actions = agent._preflight_actions("OK", [action], {})
+        self.assertEqual(len(actions), 1)
+        assigns = actions[0].parameters.get("assignments")
+        self.assertIsInstance(assigns, list)
+        self.assertIn({"net": "GND", "ref": "U3", "pad": "8"}, assigns)
+        self.assertIn({"net": "GND", "ref": "C1", "pad": "2"}, assigns)
+        self.assertIn({"net": "+5V", "ref": "U3", "pad": "7"}, assigns)
+        self.assertIn({"net": "+5V", "ref": "C1", "pad": "1"}, assigns)
+
 
 # ===================================================================
 # Step 7 — _handle_download_symbol_or_footprint end-to-end
@@ -423,13 +506,13 @@ class TestPrefixMapping(unittest.TestCase):
         from vibecad.design.library_manager import LibraryManager
         mgr = LibraryManager(kicad_user_lib_path="/tmp")
         libs = mgr._guess_kicad_libraries("ADS1256")
-        self.assertIn("Analog_ADC", libs)
+        self.assertEqual(libs, [])
 
     def test_ads_prefix_maps_to_analog_adc_lowercase(self):
         from vibecad.design.library_manager import LibraryManager
         mgr = LibraryManager(kicad_user_lib_path="/tmp")
         libs = mgr._guess_kicad_libraries("ads1256")
-        self.assertIn("Analog_ADC", libs)
+        self.assertEqual(libs, [])
 
 
 

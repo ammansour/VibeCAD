@@ -121,9 +121,9 @@ Provide a clear, concise answer:"""
         """Initialize the explainer.
         
         Args:
-            llm_client: LLM client to use. If None, runs in offline mode.
+            llm_client: LLM client to use.
         """
-        self.llm_client = llm_client  # None means offline mode
+        self.llm_client = llm_client
     
     @property
     def is_available(self) -> bool:
@@ -148,18 +148,14 @@ Provide a clear, concise answer:"""
         
         llm_client = self.llm_client
         if llm_client is None or not llm_client.is_available:
-            return self._generate_offline_explanation(request)
+            raise LLMError("LLM is required for explanations but is not available/configured.")
         
         # Build the prompt
         prompt = self._build_prompt(request)
         
         # Get LLM explanation
-        try:
-            response = llm_client.explain_simple(prompt)
-            return self._parse_explanation(response, request)
-        except LLMError:
-            # Fall back to offline explanation if LLM fails
-            return self._generate_offline_explanation(request)
+        response = llm_client.explain_simple(prompt)
+        return self._parse_explanation(response, request)
     
     def explain_single_check(self, result: CheckResult, 
                              user_question: Optional[str] = None) -> Explanation:
@@ -215,19 +211,10 @@ Provide a clear, concise answer:"""
         
         llm_client = self.llm_client
         if llm_client is None or not llm_client.is_available:
-            return self._generate_offline_answer(question, check_results)
-        
-        try:
-            response = llm_client.explain_simple(prompt)
-            return self._parse_answer(question, response, check_results)
-        except LLMError as e:
-            logger.warning(f"LLM failed, using offline answer: {e}")
-            return self._generate_offline_answer(
-                question,
-                check_results,
-                llm_error=str(e),
-                attempted_llm=True,
-            )
+            raise LLMError("LLM is required for Q&A but is not available/configured.")
+
+        response = llm_client.explain_simple(prompt)
+        return self._parse_answer(question, response, check_results)
     
     def _parse_answer(self, question: str, response: str, 
                       check_results: List[CheckResult]) -> AnswerResponse:
@@ -255,78 +242,6 @@ Provide a clear, concise answer:"""
             raw_response=response
         )
     
-    def _generate_offline_answer(
-        self,
-        question: str,
-        check_results: List[CheckResult],
-        llm_error: Optional[str] = None,
-        attempted_llm: bool = False,
-    ) -> AnswerResponse:
-        """Generate an offline answer.
-
-        This is used when:
-        - LLM is not configured, or
-        - LLM was configured but the request failed (auth/network/etc)
-        """
-        if attempted_llm and llm_error:
-            lower_err = llm_error.lower() if isinstance(llm_error, str) else ""
-            rate_limit_hint = None
-            if "http 429" in lower_err or "too many requests" in lower_err:
-                rate_limit_hint = (
-                    "This looks like rate limiting. Wait a bit (30–120s) and try again, "
-                    "and avoid rapidly clicking Ask/Explain."
-                )
-
-            answer_parts = [
-                "I couldn't get a response from the configured LLM endpoint.",
-                "",
-                f"Error: {llm_error}",
-                "",
-                "Check your Settings (API key, endpoint, model) and try again.",
-                (rate_limit_hint or ""),
-                "If this is a TLS/certificate error on macOS, try unchecking 'Verify TLS certificates' or set a CA bundle path.",
-                "If you're using GitHub Models, typical values are:",
-                "- API base: https://models.github.ai/inference",
-                "- Model: openai/gpt-5",
-                "",
-                "Based on the current check results:",
-            ]
-
-            # Remove empty hint line if not applicable
-            answer_parts = [p for p in answer_parts if p != ""]
-        else:
-            answer_parts = [
-                "I cannot provide a detailed answer because the LLM is not configured.",
-                "",
-                "Open ⚙ Settings in the VibeCAD window to set the API key/endpoint/model.",
-                "(Environment variables also work: VIBECAD_API_KEY / VIBECAD_API_BASE / VIBECAD_MODEL or GITHUB_TOKEN.)",
-                "",
-                "Based on the current check results:",
-            ]
-        
-        rules_found = []
-        for result in check_results:
-            status = "passed" if result.passed else "failed"
-            answer_parts.append(f"- {result.check_name}: {status}")
-            for finding in result.findings:
-                rules_found.append(finding.rule_id)
-                answer_parts.append(f"  • [{finding.rule_id}] {finding.message}")
-
-        if not attempted_llm:
-            answer_parts.append("")
-            answer_parts.append(
-                "To get detailed answers, configure the LLM in ⚙ Settings (or set VIBECAD_API_KEY / GITHUB_TOKEN)."
-            )
-        
-        return AnswerResponse(
-            question=question,
-            answer="\n".join(answer_parts),
-            referenced_components=[],
-            referenced_nets=[],
-            referenced_rules=rules_found,
-            raw_response=None
-        )
-
     def _build_prompt(self, request: ExplanationRequest) -> str:
         """Build the prompt for the LLM."""
         # Serialize check results to JSON
@@ -403,51 +318,6 @@ Provide a clear, concise answer:"""
             return first
         return response[:500] if len(response) > 500 else response
     
-    def _generate_offline_explanation(self, request: ExplanationRequest) -> Explanation:
-        """Generate a basic explanation without LLM.
-        
-        Used when LLM is not available or fails.
-        """
-        summaries = []
-        details = []
-        
-        for result in request.check_results:
-            if result.passed:
-                summaries.append(f"✓ {result.check_name}: Passed")
-            else:
-                error_count = result.error_count
-                warning_count = result.warning_count
-                
-                status_parts = []
-                if error_count:
-                    status_parts.append(f"{error_count} error(s)")
-                if warning_count:
-                    status_parts.append(f"{warning_count} warning(s)")
-                
-                summaries.append(f"✗ {result.check_name}: {', '.join(status_parts)}")
-                
-                # Add finding details
-                for finding in result.findings:
-                    detail = f"[{finding.rule_id}] {finding.message}"
-                    if finding.layer:
-                        detail += f" (Layer: {finding.layer})"
-                    if finding.location_x is not None and finding.location_y is not None:
-                        detail += f" at ({finding.location_x:.2f}, {finding.location_y:.2f}) mm"
-                    details.append(detail)
-        
-        summary = "Design Review Results:\n" + "\n".join(summaries)
-        
-        return Explanation(
-            summary=summary,
-            detailed_explanations=details if details else ["No issues detected."],
-            suggested_checks=[
-                "Run additional design rule checks",
-                "Review board outline for manufacturing requirements",
-                "Verify all components are properly placed"
-            ],
-            raw_response=None
-        )
-
 
 def explain_check_results(results: List[CheckResult], 
                           user_question: Optional[str] = None,

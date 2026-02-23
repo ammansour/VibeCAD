@@ -22,21 +22,13 @@ class InfoGatheringAgent(SubAgent):
     NAME = "info_gathering"
 
     SYSTEM_PROMPT = (
-        "You are the InfoGathering sub-agent of VibeCAD, a KiCad PCB design assistant.\n\n"
-        "Your ONLY job is to identify which components and information are needed for the "
-        "user's design and produce SEARCH_PART / SEARCH_WEB / LOOKUP_DATASHEET actions.\n\n"
-        "Rules:\n"
-        "- For each distinct component the user mentions (or that the design requires), "
-        "  emit one SEARCH_PART action with a specific MPN or short description.\n"
-        "- SEARCH_PART actions MUST include parameters: {\"query\": \"...\"}.\n"
-        "- SEARCH_WEB actions MUST include parameters: {\"query\": \"...\"}.\n"
-        "- LOOKUP_DATASHEET actions MUST include parameters: {\"mpn\": \"...\"} (an actual MPN).\n"
-        "- If you don't have an actual MPN, do NOT emit LOOKUP_DATASHEET.\n"
-        "- If you need pinout or package information for an IC, emit LOOKUP_DATASHEET using its MPN.\n"
-        "- Never propose placement, routing, or board-outline actions.\n"
-        "- Return ONLY a JSON array of actions. No markdown, no extra text.\n"
-        "- Each action: {\"action_type\": \"SEARCH_PART\"|\"SEARCH_WEB\"|\"LOOKUP_DATASHEET\", "
-        "  \"description\": \"...\", \"parameters\": {...}}\n"
+        "You are the InfoGathering sub-agent.\n"
+        "Only propose SEARCH_PART, SEARCH_WEB, or LOOKUP_DATASHEET actions.\n"
+        "SEARCH_PART/SEARCH_WEB require parameters.query.\n"
+        "LOOKUP_DATASHEET requires parameters.mpn; skip it if no real MPN.\n"
+        "If the user goal implies adding/placing any components, propose SEARCH_PART actions for the key components first so later phases can use real local footprint/symbol names.\n"
+        "Never propose placement/routing actions.\n"
+        "Return JSON array only.\n"
     )
 
     HANDLED_ACTION_TYPES: frozenset = frozenset()  # set in __init_subclass__
@@ -63,37 +55,45 @@ class InfoGatheringAgent(SubAgent):
         board_snapshot: Optional[Dict[str, Any]] = None,
     ) -> SubAgentResult:
         """Identify needed components and produce search actions."""
-        from ..design_agent import DesignAction, DesignActionType
-
-        # Try LLM-based planning first.
-        if self._llm_available():
-            raw = self._llm_chat(self._build_prompt(goal, context, board_snapshot))
-            actions = self._parse_actions(raw)
-            if actions:
-                return SubAgentResult(
-                    message="Searching for components and datasheets…",
-                    actions=actions,
-                    confidence=0.85,
-                    thinking=f"LLM proposed {len(actions)} info-gathering actions",
-                )
-
-        # Fallback: extract component-like tokens and create SEARCH_PART actions.
-        actions = self._fallback_extract(goal)
+        goal_text = self._extract_primary_goal_text(goal)
+        raw = self._llm_chat(self._build_prompt(goal_text, context, board_snapshot))
+        actions = self._parse_actions(raw)
         if actions:
             return SubAgentResult(
-                message="Searching for mentioned components…",
+                message="Searching for components and datasheets…",
                 actions=actions,
-                confidence=0.5,
-                thinking="Fallback regex extraction",
+                phase_complete=True,
+                confidence=0.85,
+                thinking=f"LLM proposed {len(actions)} info-gathering actions",
             )
-
         return SubAgentResult(
             message="No specific components detected to search for.",
             phase_complete=True,
             confidence=0.3,
+            thinking="LLM proposed no info-gathering actions",
         )
 
     # ── Internal ────────────────────────────────────────────────
+
+    @staticmethod
+    def _extract_primary_goal_text(goal: str) -> str:
+        """Extract user intent from phase+feedback wrapper text."""
+        text = str(goal or "").strip()
+        if not text:
+            return ""
+
+        # Orchestrator appends prior step logs under this marker.
+        feedback_marker = "FEEDBACK FROM PREVIOUS STEP:"
+        if feedback_marker in text:
+            text = text.split(feedback_marker, 1)[0].strip()
+
+        m = re.search(r"USER GOAL:\s*(.+)$", text, re.IGNORECASE | re.DOTALL)
+        if m:
+            text = m.group(1).strip()
+
+        # Remove optional phase hint prefix.
+        text = re.sub(r"^PHASE:\s*[A-Z_]+\s*[—-]\s*.*\n", "", text, flags=re.IGNORECASE)
+        return text.strip()
 
     def _build_prompt(self, goal, context, board_snapshot) -> str:
         existing = ""
@@ -110,16 +110,19 @@ class InfoGatheringAgent(SubAgent):
     def _parse_actions(self, raw: str) -> list:
         from ..design_agent import DesignAction, DesignActionType
 
+        from ...llm.client import LLMError
         if not raw:
-            return []
+            raise LLMError("info_gathering: empty LLM response.")
         try:
             start = raw.find("[")
             end = raw.rfind("]") + 1
             if start < 0 or end <= start:
-                return []
+                raise LLMError("info_gathering: expected a JSON array.")
             items = json.loads(raw[start:end])
-        except Exception:
-            return []
+        except LLMError:
+            raise
+        except Exception as e:
+            raise LLMError(f"info_gathering: failed to parse JSON array: {e}") from e
 
         actions: list = []
         type_map = {
@@ -138,75 +141,16 @@ class InfoGatheringAgent(SubAgent):
             if not isinstance(params, dict):
                 params = {}
             desc = str(item.get("description", "") or "").strip()
-            # Self-heal common LLM omission: if required keys are missing, try
-            # to recover a query from description.
-            if atype == DesignActionType.SEARCH_PART and not str(params.get("query", "") or "").strip():
-                if desc:
-                    params["query"] = desc
-            if atype == DesignActionType.SEARCH_WEB and not str(params.get("query", "") or "").strip():
-                if desc:
-                    params["query"] = desc
-            if atype == DesignActionType.LOOKUP_DATASHEET and not str(params.get("mpn", "") or "").strip():
-                # For datasheets, only accept an obvious MPN-like token.
-                m = re.search(r"\b([A-Za-z]{2,}\d{2,}[A-Za-z0-9_+\-./]{0,60})\b", desc)
-                if m:
-                    params["mpn"] = m.group(1)
-                else:
-                    # Skip invalid datasheet lookup actions rather than erroring.
-                    continue
+            if atype in (DesignActionType.SEARCH_PART, DesignActionType.SEARCH_WEB):
+                if not str(params.get("query", "") or "").strip():
+                    raise LLMError(f"info_gathering: missing required parameters.query for {atype.name}.")
+            if atype == DesignActionType.LOOKUP_DATASHEET:
+                if not str(params.get("mpn", "") or "").strip():
+                    raise LLMError("info_gathering: missing required parameters.mpn for LOOKUP_DATASHEET.")
             actions.append(DesignAction(
                 action_type=atype,
                 description=str(item.get("description", "")),
                 parameters=params,
-                requires_approval=False,
-            ))
-        return actions
-
-    def _fallback_extract(self, goal: str) -> list:
-        """Regex-based extraction of component tokens → SEARCH_PART actions.
-
-        Handles both explicit MPNs (ATmega328P, LM7805) and high-level board
-        names (Arduino UNO, ESP32 DevKit) by searching for MPN-like tokens
-        first, then falling back to recognisable board / module names.
-        """
-        from ..design_agent import DesignAction, DesignActionType
-
-        # 1. Explicit MPN patterns: ATmega328P-PU, STM32F103, LM7805, USB-C, etc.
-        tokens = re.findall(
-            r"\b([A-Z]{2,}[0-9][A-Z0-9\-]{2,})\b",
-            goal,
-            re.IGNORECASE,
-        )
-
-        # 2. Well-known board / module names (case-insensitive).
-        board_patterns = [
-            r"\b(arduino\s+\w+)\b",
-            r"\b(esp32[\w\-]*)\b",
-            r"\b(esp8266[\w\-]*)\b",
-            r"\b(raspberry\s+pi[\w\s]*?(?:pico|zero|[0-9]+)?)\b",
-            r"\b(stm32[\w\-]+)\b",
-            r"\b(teensy[\w\-]*)\b",
-            r"\b(nrf52[\w\-]*)\b",
-        ]
-        for pat in board_patterns:
-            for m in re.finditer(pat, goal, re.IGNORECASE):
-                tokens.append(m.group(1).strip())
-
-        # 3. Quoted component names: "LM7805", 'ATmega328P'
-        for m in re.finditer(r"""['"]([^'"]{2,30})['"]""", goal):
-            tokens.append(m.group(1).strip())
-
-        seen: set = set()
-        actions: list = []
-        for tok in tokens:
-            key = tok.upper().strip()
-            if key in seen or len(key) < 2:
-                continue
-            seen.add(key)
-            actions.append(DesignAction(
-                action_type=DesignActionType.SEARCH_PART,
-                description=f"Search for {tok}",
-                parameters={"query": tok},
                 requires_approval=False,
             ))
         return actions

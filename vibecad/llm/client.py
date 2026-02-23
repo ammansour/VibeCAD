@@ -42,7 +42,7 @@ class LLMConfig:
     
     # Request parameters
     temperature: float = 0.3  # Low temperature for consistent explanations
-    max_tokens: int = 1024
+    max_tokens: int = 2048
     timeout: int = 30
 
     # TLS / SSL
@@ -95,7 +95,7 @@ class LLMConfig:
             api_base=api_base,
             model=model,
             temperature=float(os.environ.get('VIBECAD_TEMPERATURE', '0.3')),
-            max_tokens=int(os.environ.get('VIBECAD_MAX_TOKENS', '1024')),
+            max_tokens=int(os.environ.get('VIBECAD_MAX_TOKENS', '2048')),
             timeout=int(os.environ.get('VIBECAD_TIMEOUT', '30')),
             verify_ssl=_parse_bool(os.environ.get('VIBECAD_SSL_VERIFY', ''), True),
             ca_bundle=os.environ.get('VIBECAD_CA_BUNDLE', '').strip(),

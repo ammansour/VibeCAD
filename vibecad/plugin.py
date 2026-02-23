@@ -99,7 +99,7 @@ class VibeCADPlugin:
         self.active_editor: str = "pcb"  # "pcb" or "schematic"
         self.check_results: List[CheckResult] = []
         self.llm_client: Optional[LLMClient] = None
-        # Always set (offline fallback if LLM not configured)
+        # Always set; explainer methods will raise if LLM is unavailable.
         self.explainer: IssueExplainer = IssueExplainer(None)
         
         # Phase 3: Suggestion manager for assisted design actions
@@ -973,12 +973,14 @@ class VibeCADPlugin:
     def _route_design_message_async(self, message: str) -> None:
         """Route message to Q&A or AgentLoop using the LLM (non-blocking)."""
         if not WX_AVAILABLE:
-            # In non-wx environments, keep deterministic fallback behavior.
-            decision = decide_route(self.llm_client, message)
-            if decision.route == 'qa':
-                self._answer_design_question_async(message)
-            else:
-                self._start_agent_loop(message)
+            try:
+                decision = decide_route(self.llm_client, message)
+                if decision.route == 'qa':
+                    self._answer_design_question_async(message)
+                else:
+                    self._start_agent_loop(message)
+            except Exception:
+                logger.exception("Failed to route design message (non-wx)")
             return
 
         def worker():
@@ -1002,9 +1004,10 @@ class VibeCADPlugin:
                 wx.CallAfter(self._start_agent_loop, message)
             except Exception:
                 logger.exception("Failed to route design message")
-                # Fail safe: start agent
                 try:
-                    wx.CallAfter(self._start_agent_loop, message)
+                    if self.frame:
+                        wx.CallAfter(self.frame.add_design_response, "❌ LLM routing failed. Check your API/model settings and retry.")
+                        wx.CallAfter(self.frame.set_agent_running, False)
                 except Exception:
                     pass
 
@@ -1014,6 +1017,9 @@ class VibeCADPlugin:
         """Answer a user question in the Design tab without starting AgentLoop."""
         if not WX_AVAILABLE or not self.frame:
             return
+        if not self.llm_client or not self.llm_client.is_available:
+            wx.CallAfter(self.frame.add_design_response, "❌ LLM is not available/configured. Configure it in ⚙ Settings and retry.")
+            return
 
         # Load PCB/schematic data NOW on the GUI thread (pcbnew not thread-safe).
         try:
@@ -1021,20 +1027,6 @@ class VibeCADPlugin:
             self._load_schematic_data()
         except Exception:
             logger.debug("Pre-load board data failed for Q&A", exc_info=True)
-
-        def _offline_answer(q: str) -> str:
-            ql = (q or "").strip().lower()
-            if "resistor" in ql and ("r" in ql or "r1" in ql or "value" in ql or "recommend" in ql):
-                return (
-                    "It depends what R1 does. Quick defaults:\n\n"
-                    "- **Pull-up / pull-down**: 4.7k–10k is typical (lower = stronger, more current).\n"
-                    "- **LED series**: $R = (V_{supply} - V_f)/I$ (e.g., 3.3V→2.0V @ 5mA → ~260Ω → 270Ω).\n"
-                    "- **I2C pull-ups**: often 2.2k–10k depending on bus capacitance/speed.\n\n"
-                    "If you tell me R1’s role (pull-up? LED? divider?), voltage, and target current, I can narrow it down."
-                )
-            return (
-                "I can answer, but I need a bit more context (what is the part/net, voltage levels, currents, and what you’re trying to achieve?)."
-            )
 
         def worker():
             try:
@@ -1084,35 +1076,30 @@ class VibeCADPlugin:
                     except Exception:
                         logger.debug("Web search for Q&A failed", exc_info=True)
 
-                if self.llm_client and self.llm_client.is_available:
-                    try:
-                        from .llm.client import LLMMessage
+                from .llm.client import LLMMessage
 
-                        system_prompt = (
-                            "You are VibeCAD's Q&A assistant. The user is asking an informational question "
-                            "about their PCB/schematic design. You have real-time access to their board state "
-                            "(component values, net connections, footprints) provided below.\n\n"
-                            "Answer directly and concisely. Reference specific component designators (R1, U3, etc.) "
-                            "and net names from the board data when relevant. "
-                            "If critical context is missing, ask 1-3 clarifying questions "
-                            "and provide typical ranges or rules of thumb. "
-                            "Do NOT propose tool/actions or start multi-step planning."
-                        )
+                system_prompt = (
+                    "You are VibeCAD's Q&A assistant. The user is asking an informational question "
+                    "about their PCB/schematic design. You have real-time access to their board state "
+                    "(component values, net connections, footprints) provided below.\n\n"
+                    "Answer directly and concisely. Reference specific component designators (R1, U3, etc.) "
+                    "and net names from the board data when relevant. "
+                    "If critical context is missing, ask 1-3 clarifying questions "
+                    "and provide typical ranges or rules of thumb. "
+                    "Do NOT propose tool/actions or start multi-step planning."
+                )
 
-                        prompt_parts = [question.strip()]
-                        if circuit_context_str:
-                            prompt_parts.append(f"\n\n--- CURRENT BOARD STATE ---\n{circuit_context_str}")
-                        if web_context_str:
-                            prompt_parts.append(f"\n\n--- COMPONENT WEB DATA ---{web_context_str}")
-                        user_prompt = "\n".join(prompt_parts)
+                prompt_parts = [question.strip()]
+                if circuit_context_str:
+                    prompt_parts.append(f"\n\n--- CURRENT BOARD STATE ---\n{circuit_context_str}")
+                if web_context_str:
+                    prompt_parts.append(f"\n\n--- COMPONENT WEB DATA ---{web_context_str}")
+                user_prompt = "\n".join(prompt_parts)
 
-                        resp = self.llm_client.chat([LLMMessage(role='user', content=user_prompt)], system_prompt=system_prompt)
-                        answer = (resp.content or "").strip() or _offline_answer(question)
-                    except Exception:
-                        logger.exception("Design Q&A LLM call failed; falling back offline")
-                        answer = _offline_answer(question)
-                else:
-                    answer = _offline_answer(question)
+                resp = self.llm_client.chat([LLMMessage(role='user', content=user_prompt)], system_prompt=system_prompt)
+                answer = (resp.content or "").strip()
+                if not answer:
+                    raise ValueError("LLM returned empty answer content.")
 
                 wx.CallAfter(self.frame.add_design_response, answer)
             except Exception as e:
@@ -1704,12 +1691,10 @@ class VibeCADPlugin:
             user_question=question
         )
         
-        if self.explainer and self.explainer.is_available:
-            return self.explainer.explain(request)
-        else:
-            # Offline explanation
-            explainer = IssueExplainer(None)
-            return explainer._generate_offline_explanation(request)
+        from .llm.client import LLMError
+        if not self.explainer or not self.explainer.is_available:
+            raise LLMError("LLM is required for explanations but is not available/configured.")
+        return self.explainer.explain(request)
     
     # CLI interface for standalone usage
     def run_checks_on_file(self, pcb_path: str) -> List[CheckResult]:

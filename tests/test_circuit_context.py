@@ -318,6 +318,20 @@ class TestComponentWebSearch:
         assert results[0].mpn == "STM32F103C8T6"
         assert results[0].manufacturer == "STMicroelectronics"
 
+    @patch('vibecad.design.component_search.urlopen')
+    def test_search_lcsc_list_response_is_safe(self, mock_urlopen):
+        """Unexpected list-shaped JSON should not crash the parser."""
+        import json
+        mock_response = MagicMock()
+        mock_response.__enter__ = MagicMock(return_value=mock_response)
+        mock_response.__exit__ = MagicMock(return_value=False)
+        mock_response.read.return_value = json.dumps([]).encode("utf-8")
+        mock_urlopen.return_value = mock_response
+
+        searcher = ComponentWebSearch()
+        results = searcher._search_lcsc("anything", 5)
+        assert results == []
+
     def test_search_empty_query(self):
         """Empty query should return empty results."""
         searcher = ComponentWebSearch()

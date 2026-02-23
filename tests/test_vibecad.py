@@ -122,6 +122,46 @@ class TestPCBParser(unittest.TestCase):
         self.assertFalse(data.has_board_outline)
 
 
+class TestDesignAgentLLMParsing(unittest.TestCase):
+    def test_retries_on_truncated_json(self):
+        """Truncated JSON from the LLM should trigger one resend retry."""
+        from vibecad.design.design_agent import DesignAgent
+
+        class _Resp:
+            def __init__(self, content: str, finish_reason=None):
+                self.content = content
+                self.raw_response = {"choices": [{"finish_reason": finish_reason}]}
+
+        class _Cfg:
+            def __init__(self):
+                self.max_tokens = 256
+
+        class _LLM:
+            is_available = True
+
+            def __init__(self):
+                self.config = _Cfg()
+                self.calls = 0
+
+            def chat(self, messages, system_prompt=None):
+                self.calls += 1
+                if self.calls == 1:
+                    # Unterminated JSON string → JSONDecodeError
+                    return _Resp(
+                        '{"assistant_message":"hi","actions":[{"action_type":"SEARCH_PART","description":"x","parameters":{"query":"ATmega'
+                    )
+                return _Resp(
+                    '{"assistant_message":"ok","actions":[{"action_type":"SEARCH_PART","description":"x","parameters":{"query":"ATmega328P"}}]}'
+                )
+
+        llm = _LLM()
+        agent = DesignAgent(llm_client=llm)
+        msg, actions, conf = agent._chat_with_llm("search atmega328p", {"active_editor": "pcb"})
+        self.assertEqual(msg, "ok")
+        self.assertEqual(len(actions), 1)
+        self.assertGreaterEqual(llm.calls, 2)
+
+
 class TestBoardOutlineCheck(unittest.TestCase):
     """Tests for board outline checks."""
     
@@ -361,7 +401,7 @@ class TestDesignAgentLLMActionParsing(unittest.TestCase):
                 self.config = LLMConfig(api_key="x", max_tokens=256)
 
             def chat(self, messages, system_prompt=None):
-                content = '{"assistant_message":"Searching…","actions":[{"actiontype":"SEARCHPART","description":"Search for ADS1256","parameters":{"query":"ADS1256"},"requiresApproval":false}]}'
+                content = '{"assistant_message":"Searching…","actions":[{"actiontype":"SEARCH_PART","description":"Search for ADS1256","parameters":{"query":"ADS1256"},"requiresApproval":false}]}'
                 return LLMResponse(
                     content=content,
                     model="test",
@@ -381,9 +421,9 @@ class TestDesignAgentLLMActionParsing(unittest.TestCase):
         self.assertFalse(actions[0].requires_approval)
         self.assertGreater(conf, 0.5)
 
-    def test_salvages_action_from_truncated_json(self):
+    def test_truncated_json_raises(self):
         from vibecad.design.design_agent import DesignAgent, DesignActionType
-        from vibecad.llm.client import LLMConfig, LLMResponse
+        from vibecad.llm.client import LLMConfig, LLMResponse, LLMError
 
         class _FakeClient:
             def __init__(self):
@@ -403,13 +443,8 @@ class TestDesignAgentLLMActionParsing(unittest.TestCase):
                 )
 
         agent = DesignAgent(llm_client=_FakeClient())
-        msg, actions, conf = agent._chat_with_llm("search ADS1256", context={})
-        self.assertTrue(msg)  # any assistant text is fine
-        self.assertEqual(len(actions), 1)
-        self.assertEqual(actions[0].action_type, DesignActionType.SEARCH_PART)
-        self.assertEqual(actions[0].parameters.get("query"), "ADS1256")
-        self.assertFalse(actions[0].requires_approval)
-        self.assertGreater(conf, 0.5)
+        with self.assertRaises(LLMError):
+            agent._chat_with_llm("search ADS1256", context={})
 
 
 class TestSettingsPersistence(unittest.TestCase):
@@ -432,6 +467,7 @@ class TestLLMExplainer(unittest.TestCase):
     def test_offline_explanation(self):
         from vibecad.checks.base import CheckResult, Finding, Severity
         from vibecad.llm.explainer import IssueExplainer, ExplanationRequest
+        from vibecad.llm.client import LLMError
         
         result = CheckResult(
             check_id='TEST_001',
@@ -450,11 +486,8 @@ class TestLLMExplainer(unittest.TestCase):
         # Test without LLM (offline mode)
         explainer = IssueExplainer(None)
         request = ExplanationRequest(check_results=[result])
-        
-        explanation = explainer.explain(request)
-        
-        self.assertIn('Test Check', explanation.summary)
-        self.assertIn('error', explanation.summary.lower())
+        with self.assertRaises(LLMError):
+            explainer.explain(request)
 
 
 class TestBOMExporter(unittest.TestCase):
@@ -599,38 +632,28 @@ class TestDesignAgent(unittest.TestCase):
         self.assertFalse(action.executed)
     
     def test_design_agent_interpret_search(self):
-        from vibecad.design.design_agent import DesignAgent, DesignActionType
+        from vibecad.design.design_agent import DesignAgent
+        from vibecad.llm.client import LLMError
         
         agent = DesignAgent(llm_client=None)
-        
-        request = agent.interpret_request("find a USB-C connector")
-        
-        self.assertEqual(len(request.interpreted_actions), 1)
-        action = request.interpreted_actions[0]
-        self.assertEqual(action.action_type, DesignActionType.SEARCH_PART)
-        self.assertIn('usb', action.parameters.get('query', '').lower())
+        with self.assertRaises(LLMError):
+            agent.interpret_request("find a USB-C connector")
     
     def test_design_agent_interpret_bom(self):
-        from vibecad.design.design_agent import DesignAgent, DesignActionType
+        from vibecad.design.design_agent import DesignAgent
+        from vibecad.llm.client import LLMError
         
         agent = DesignAgent(llm_client=None)
-        
-        request = agent.interpret_request("export BOM for JLCPCB")
-        
-        self.assertEqual(len(request.interpreted_actions), 1)
-        action = request.interpreted_actions[0]
-        self.assertEqual(action.action_type, DesignActionType.EXPORT_BOM)
+        with self.assertRaises(LLMError):
+            agent.interpret_request("export BOM for JLCPCB")
     
     def test_design_agent_interpret_connect(self):
-        from vibecad.design.design_agent import DesignAgent, DesignActionType
+        from vibecad.design.design_agent import DesignAgent
+        from vibecad.llm.client import LLMError
         
         agent = DesignAgent(llm_client=None)
-        
-        request = agent.interpret_request("connect U1 pin 1 to R1 pin 2")
-        
-        self.assertEqual(len(request.interpreted_actions), 1)
-        action = request.interpreted_actions[0]
-        self.assertEqual(action.action_type, DesignActionType.DRAW_TRACK)
+        with self.assertRaises(LLMError):
+            agent.interpret_request("connect U1 pin 1 to R1 pin 2")
     
     def test_design_agent_suggestions(self):
         from vibecad.design.design_agent import DesignAgent
@@ -724,13 +747,13 @@ class TestLibraryManagerSearch(unittest.TestCase):
         from vibecad.design.library_manager import LibraryManager
         mgr = LibraryManager(kicad_user_lib_path="/tmp")
         libs = mgr._guess_kicad_libraries("PIC16F877A")
-        self.assertEqual(libs, ["MCU_Microchip_PIC16"])
+        self.assertEqual(libs, [])
 
     def test_guess_kicad_libraries_stm32(self):
         from vibecad.design.library_manager import LibraryManager
         mgr = LibraryManager(kicad_user_lib_path="/tmp")
         libs = mgr._guess_kicad_libraries("STM32F103")
-        self.assertEqual(libs, ["MCU_ST_STM32"])
+        self.assertEqual(libs, [])
 
     def test_guess_kicad_libraries_unknown(self):
         from vibecad.design.library_manager import LibraryManager
@@ -844,37 +867,37 @@ class TestLibraryManagerLocalSearch(unittest.TestCase):
         self.assertAlmostEqual(score, 0.0)
 
     def test_guess_kicad_libraries_keyword_battery(self):
-        """Keyword 'battery' should map to Battery library."""
+        """Keyword guessing is disabled (global local search is used instead)."""
         from vibecad.design.library_manager import LibraryManager
         mgr = LibraryManager(kicad_user_lib_path="/tmp")
         libs = mgr._guess_kicad_libraries("battery holder")
-        self.assertIn("Battery", libs)
+        self.assertEqual(libs, [])
 
     def test_guess_kicad_libraries_keyword_keystone(self):
-        """Manufacturer name 'Keystone' should map to Battery."""
+        """Keyword guessing is disabled (global local search is used instead)."""
         from vibecad.design.library_manager import LibraryManager
         mgr = LibraryManager(kicad_user_lib_path="/tmp")
         libs = mgr._guess_kicad_libraries("Keystone 590")
-        self.assertIn("Battery", libs)
+        self.assertEqual(libs, [])
 
     def test_guess_kicad_libraries_keyword_usb(self):
         from vibecad.design.library_manager import LibraryManager
         mgr = LibraryManager(kicad_user_lib_path="/tmp")
         libs = mgr._guess_kicad_libraries("USB Type-C connector")
-        self.assertIn("Connector_USB", libs)
+        self.assertEqual(libs, [])
 
     def test_guess_kicad_libraries_keyword_molex(self):
         from vibecad.design.library_manager import LibraryManager
         mgr = LibraryManager(kicad_user_lib_path="/tmp")
         libs = mgr._guess_kicad_libraries("Molex connector")
-        self.assertIn("Connector_Molex", libs)
+        self.assertEqual(libs, [])
 
     def test_guess_kicad_libraries_prefix_still_works(self):
-        """Prefix matching should still take priority."""
+        """Prefix guessing is disabled."""
         from vibecad.design.library_manager import LibraryManager
         mgr = LibraryManager(kicad_user_lib_path="/tmp")
         libs = mgr._guess_kicad_libraries("PIC16F877A")
-        self.assertEqual(libs, ["MCU_Microchip_PIC16"])
+        self.assertEqual(libs, [])
 
     def test_build_local_index_with_fake_tree(self):
         """Build index from a synthetic KiCad-like directory tree."""
@@ -1085,11 +1108,11 @@ class TestEasyEDASearch(unittest.TestCase):
         self.assertIsNone(result)
 
     def test_guess_kicad_libraries_ads_prefix(self):
-        """ADS1256 should map to Analog_ADC via prefix matching."""
+        """Prefix guessing is disabled."""
         from vibecad.design.library_manager import LibraryManager
         mgr = LibraryManager(kicad_user_lib_path="/tmp")
         libs = mgr._guess_kicad_libraries("ADS1256")
-        self.assertIn("Analog_ADC", libs)
+        self.assertEqual(libs, [])
 
 
 if __name__ == '__main__':

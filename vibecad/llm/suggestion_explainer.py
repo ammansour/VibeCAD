@@ -81,7 +81,7 @@ Remember:
         """Initialize the explainer.
         
         Args:
-            llm_client: LLM client to use. If None, provides offline explanations.
+            llm_client: LLM client to use.
         """
         self.llm_client = llm_client
     
@@ -107,15 +107,11 @@ Remember:
             suggestion_json=suggestion_json
         )
         
-        if self.llm_client and self.llm_client.is_available:
-            try:
-                response = self.llm_client.explain_simple(prompt)
-                return self._parse_explanation(response)
-            except LLMError as e:
-                logger.warning(f"LLM explanation failed: {e}")
-                return self._generate_offline_explanation(suggestion)
-        else:
-            return self._generate_offline_explanation(suggestion)
+        if not self.llm_client or not self.llm_client.is_available:
+            raise LLMError("LLM is required for suggestion explanations but is not available/configured.")
+
+        response = self.llm_client.explain_simple(prompt)
+        return self._parse_explanation(response)
     
     def _parse_explanation(self, response: str) -> SuggestionExplanation:
         """Parse LLM response into structured explanation."""
@@ -155,43 +151,6 @@ Remember:
         if section_lines:
             return '\n'.join(section_lines).strip()
         return None
-    
-    def _generate_offline_explanation(self, suggestion: Suggestion) -> SuggestionExplanation:
-        """Generate explanation without LLM."""
-        # Build what will change from geometry changes
-        changes_desc = []
-        for change in suggestion.geometry_changes:
-            if change.description:
-                changes_desc.append(f"• {change.description}")
-            else:
-                changes_desc.append(f"• {change.change_type} on {change.layer}")
-        
-        what_will_change = '\n'.join(changes_desc) if changes_desc else "No changes specified."
-        
-        # Build why reasonable from rule ID and description
-        why_reasonable = (
-            f"This suggestion addresses {suggestion.rule_id}.\n"
-            f"{suggestion.description}"
-        )
-        
-        # Format assumptions
-        assumptions_text = '\n'.join(f"• {a}" for a in suggestion.assumptions) if suggestion.assumptions else "No assumptions documented."
-        
-        # Generic risks
-        risks = (
-            "• Review the suggested changes before applying\n"
-            "• Use Edit > Undo (Ctrl+Z) to revert if needed\n"
-            "• Run design rule checks after applying\n"
-            "• This is a deterministic suggestion, not AI-generated geometry"
-        )
-        
-        return SuggestionExplanation(
-            what_will_change=what_will_change,
-            why_reasonable=why_reasonable,
-            assumptions_explained=assumptions_text,
-            risks_and_notes=risks,
-            raw_response=None
-        )
     
     def format_explanation(self, explanation: SuggestionExplanation) -> str:
         """Format explanation for display in UI."""

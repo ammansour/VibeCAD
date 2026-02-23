@@ -159,29 +159,20 @@ class PlacementAgent(SubAgent):
     NAME = "placement"
 
     SYSTEM_PROMPT = (
-        "You are the Placement sub-agent of VibeCAD.\n\n"
-        "Your ONLY job is to propose component placement actions:\n"
-        "  ADD_COMPONENT, MOVE_COMPONENT, ROTATE_COMPONENT, ALIGN_COMPONENTS,\n"
-        "  DEFINE_BOARD_OUTLINE, ADD_MOUNTING_HOLE.\n\n"
-        "Placement strategy:\n"
-        "1. MCU / main IC → board centre.\n"
-        "2. Connectors (USB, headers, DC jack) → board edges.\n"
-        "3. Decoupling caps → within 5 mm of their IC's VCC/GND pins.\n"
-        "4. Crystal / oscillator → within 8 mm of the MCU's XTAL pins.\n"
-        "5. Voltage regulators → between power input and MCU.\n"
-        "6. LEDs / discretes → near the signal they monitor.\n"
-        "7. Mounting holes → 3 mm inset from board corners.\n"
-        "8. Keep at least 2 mm courtyard-to-courtyard clearance.\n"
-        "9. Board outline: size it with ≥ 20% margin beyond the component area.\n\n"
-        "CRITICAL: Never propose routing, net assignment, or verification actions.\n\n"
-        "CRITICAL (query quality):\n"
-        "- For ADD_COMPONENT, parameters.query MUST be a concrete part identifier, not an instruction.\n"
-        "  Good: \"Package_DIP:DIP-28_W7.62mm\", \"Connector_USB:USB_B\", \"Crystal:Crystal_SMD_3225-4Pin_3.2x2.5mm\".\n"
-        "  Bad: \"Place voltage regulator near power input\", \"Position connectors on board edges\".\n"
-        "- Put placement intent into description, and use MOVE_COMPONENT / ALIGN_COMPONENTS for layout-only goals.\n\n"
-        "Return ONLY a JSON array of actions.  Each action:\n"
-        '  {"action_type": "ADD_COMPONENT"|"MOVE_COMPONENT"|..., '
-        '"description": "...", "parameters": {...}}\n'
+        "You are the Placement sub-agent.\n"
+        "Only propose: ADD_COMPONENT, MOVE_COMPONENT, ROTATE_COMPONENT, ALIGN_COMPONENTS, DEFINE_BOARD_OUTLINE, ADD_MOUNTING_HOLE.\n"
+        "Never propose routing/net-assignment/verification actions.\n"
+        "ADD_COMPONENT parameters.query must be a concrete part/footprint identifier, not an instruction.\n"
+        "For from-scratch goals, avoid prebuilt module/shield footprints unless the user explicitly requests a module/shield.\n"
+        "Keep parts inside board bounds with at least ~2 mm clearance.\n"
+        "All coordinates are absolute mm in KiCad's board coordinate system. Do not assume the outline starts at (0,0);\n"
+        "use the provided board origin/center and existing component coordinates.\n"
+        "Parameter schema (use exactly these keys; do not use aliases like 'id'):\n"
+        "- MOVE_COMPONENT.parameters = {\"ref\":\"U1\",\"location\":{\"x\":10.0,\"y\":20.0}} (mm)\n"
+        "- ROTATE_COMPONENT.parameters = {\"ref\":\"U1\",\"angle\":90} (degrees)\n"
+        "- ALIGN_COMPONENTS.parameters = {\"refs\":[\"U1\",\"J1\"],\"direction\":\"horizontal\"}\n"
+        "- DELETE_COMPONENT.parameters = {\"ref\":\"U1\"}\n"
+        "Return JSON array only.\n"
     )
 
     def __init__(self, llm_client=None):
@@ -205,24 +196,20 @@ class PlacementAgent(SubAgent):
         context: Dict[str, Any],
         board_snapshot: Optional[Dict[str, Any]] = None,
     ) -> SubAgentResult:
-        from ..design_agent import DesignAction, DesignActionType
-
-        # LLM-based planning for high-level goals.
-        if self._llm_available():
-            raw = self._llm_chat(self._build_prompt(goal, context, board_snapshot))
-            actions = self._parse_actions(raw)
-            if actions:
-                return SubAgentResult(
-                    message=f"Proposing {len(actions)} placement action(s).",
-                    actions=actions,
-                    confidence=0.85,
-                    thinking=f"LLM proposed {len(actions)} placement actions",
-                )
-
+        raw = self._llm_chat(self._build_prompt(goal, context, board_snapshot))
+        actions = self._parse_actions(raw, board_snapshot=board_snapshot)
+        if actions:
+            return SubAgentResult(
+                message=f"Proposing {len(actions)} placement action(s).",
+                actions=actions,
+                confidence=0.85,
+                thinking=f"LLM proposed {len(actions)} placement actions",
+            )
         return SubAgentResult(
-            message="Could not generate placement actions. Specify components to place.",
-            confidence=0.2,
-            phase_complete=True,  # Don't get stuck — let orchestrator advance
+            message="No placement actions proposed.",
+            confidence=0.3,
+            phase_complete=False,
+            thinking="LLM proposed no placement actions",
         )
 
     # ── Smart layout optimization ───────────────────────────────
@@ -491,6 +478,24 @@ class PlacementAgent(SubAgent):
 
     # ── Internal ────────────────────────────────────────────────
 
+    @staticmethod
+    def _clean_component_query(text: str) -> str:
+        q = str(text or "").strip()
+        if not q:
+            return ""
+        q = re.sub(r"^[\"']|[\"']$", "", q).strip()
+        q = re.sub(r"^(add|place|insert|use|put|mount)\s+", "", q, flags=re.IGNORECASE).strip()
+        q = re.sub(r"\b(component|footprint)\b", "", q, flags=re.IGNORECASE).strip()
+        q = re.sub(r"\s+", " ", q).strip(" .,:;")
+        return q
+
+    @staticmethod
+    def _looks_instruction_query(query: str) -> bool:
+        q = str(query or "").strip().lower()
+        if not q:
+            return True
+        return bool(re.match(r"^(add|place|insert|use|put|mount)\b", q))
+
     def _build_prompt(self, goal, context, board_snapshot) -> str:
         existing = ""
         if board_snapshot and board_snapshot.get("components"):
@@ -505,32 +510,47 @@ class PlacementAgent(SubAgent):
 
         search_context = ""
         if board_snapshot and isinstance(board_snapshot.get("search_part_results"), dict):
-            candidates: List[str] = []
-            for query, items in board_snapshot["search_part_results"].items():
+            summary_lines: List[str] = []
+            for query, items in list(board_snapshot["search_part_results"].items())[-12:]:
                 if not isinstance(items, list):
                     continue
+                picked: List[str] = []
                 for item in items:
                     if not isinstance(item, dict):
                         continue
                     name = str(item.get("name", "")).strip()
                     pkg = str(item.get("package", "")).strip()
+                    is_footprint = bool(item.get("is_footprint_candidate", False))
                     if not name:
                         continue
+                    if not is_footprint and ":" not in name:
+                        continue
                     label = f"{name} ({pkg})" if pkg else name
-                    candidates.append(label)
-            if candidates:
-                unique = list(dict.fromkeys(candidates))[:60]
+                    if label not in picked:
+                        picked.append(label)
+                    if len(picked) >= 2:
+                        break
+                if picked:
+                    summary_lines.append(f"- {query}: {', '.join(picked)}")
+            if summary_lines:
                 search_context = (
                     "\nPhase-1 searched candidate parts (ensure required ones are placed):\n"
-                    + "\n".join(f"- {c}" for c in unique)
+                    + "\n".join(summary_lines[:20])
                 )
 
         outline = ""
         if board_snapshot and board_snapshot.get("board_width"):
+            ox = board_snapshot.get("board_origin_x", 0.0)
+            oy = board_snapshot.get("board_origin_y", 0.0)
+            cx = board_snapshot.get("board_center_x")
+            cy = board_snapshot.get("board_center_y")
             outline = (
                 f"\nBoard outline: {board_snapshot['board_width']}×"
                 f"{board_snapshot['board_height']} mm"
+                f" (origin approx: ({ox},{oy}) mm)"
             )
+            if cx is not None and cy is not None:
+                outline += f" (center approx: ({cx},{cy}) mm)"
 
         return (
             f"USER GOAL:\n{goal}\n{existing}{search_context}{outline}\n\n"
@@ -538,18 +558,21 @@ class PlacementAgent(SubAgent):
             "Return a JSON array of actions.  Return [] if nothing to place."
         )
 
-    def _parse_actions(self, raw: str) -> list:
-        from ..design_agent import DesignAction, DesignActionType
+    def _parse_actions(self, raw: str, board_snapshot: Optional[Dict[str, Any]] = None) -> list:
+        from ..design_agent import DesignAction, DesignActionType, normalize_action_parameters
+        from ...llm.client import LLMError
         if not raw:
-            return []
+            raise LLMError("placement: empty LLM response.")
         try:
             start = raw.find("[")
             end = raw.rfind("]") + 1
             if start < 0 or end <= start:
-                return []
+                raise LLMError("placement: expected a JSON array.")
             items = json.loads(raw[start:end])
-        except Exception:
-            return []
+        except LLMError:
+            raise
+        except Exception as e:
+            raise LLMError(f"placement: failed to parse JSON array: {e}") from e
 
         type_map = {
             "ADD_COMPONENT": DesignActionType.ADD_COMPONENT,
@@ -561,17 +584,41 @@ class PlacementAgent(SubAgent):
             "DELETE_COMPONENT": DesignActionType.DELETE_COMPONENT,
         }
         actions: list = []
-        for item in items:
+        for idx, item in enumerate(items):
             if not isinstance(item, dict):
-                continue
-            atype_str = str(item.get("action_type", "")).upper()
+                raise LLMError("placement: each action must be an object.")
+            raw_atype = item.get("action_type", None)
+            if raw_atype is None or (isinstance(raw_atype, str) and not raw_atype.strip()):
+                # Common model variants.
+                for alt_key in ("actionType", "type", "action"):
+                    raw_atype = item.get(alt_key, raw_atype)
+                    if isinstance(raw_atype, str) and raw_atype.strip():
+                        break
+            atype_str = str(raw_atype or "").strip().upper()
+            if not atype_str:
+                raise LLMError(f"placement: missing required action_type for action[{idx}].")
             atype = type_map.get(atype_str)
             if atype is None:
-                continue
+                raise LLMError(f"placement: unknown action_type: {atype_str!r}")
+            params = item.get("parameters") or {}
+            if not isinstance(params, dict):
+                raise LLMError(f"placement: parameters must be an object for {atype.name}.")
+            description = str(item.get("description", "") or "").strip()
+
+            if atype == DesignActionType.ADD_COMPONENT:
+                raw_query = str(params.get("query", "") or "").strip()
+                query = self._clean_component_query(raw_query)
+                if self._looks_instruction_query(query):
+                    raise LLMError("placement: ADD_COMPONENT.query must be a concrete part/footprint identifier, not an instruction.")
+                if not query:
+                    raise LLMError("placement: missing required ADD_COMPONENT.parameters.query.")
+                params["query"] = query
+            params = normalize_action_parameters(atype, params)
+
             actions.append(DesignAction(
                 action_type=atype,
-                description=str(item.get("description", "")),
-                parameters=item.get("parameters") or {},
+                description=description,
+                parameters=params,
                 requires_approval=True,
             ))
         return actions

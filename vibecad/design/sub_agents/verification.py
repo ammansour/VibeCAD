@@ -25,22 +25,16 @@ class VerificationAgent(SubAgent):
     NAME = "verification"
 
     SYSTEM_PROMPT = (
-        "You are the Verification sub-agent of VibeCAD.\n\n"
-        "Your job: run DRC / ERC, analyse errors, and propose specific fixes.\n"
-        "Available actions: RUN_DRC, RUN_ERC.\n"
-        "You can also propose fix actions FROM OTHER DOMAINS when needed:\n"
-        "  - DELETE_TRACKS + AUTOROUTE_BOARD for short / crossing errors.\n"
-        "  - MOVE_COMPONENT for courtyard / clearance / edge errors.\n"
-        "  - ASSIGN_NETS / DEFINE_NET for missing-connection errors.\n\n"
-        "Fix strategy (apply in order):\n"
-        "1. Courtyard overlap → MOVE_COMPONENT to separate.\n"
-        "2. Board edge clearance → MOVE_COMPONENT inward.\n"
-        "3. Track clearance / short → DELETE_TRACKS then AUTOROUTE_BOARD.\n"
-        "4. Missing connection → check net assignments, then re-route.\n"
-        "5. Solder mask bridge → MOVE_COMPONENT to increase spacing.\n\n"
-        "IMPORTANT: After proposing fixes, always include a final RUN_DRC or RUN_ERC\n"
-        "so the loop can verify the fix worked.\n\n"
-        "Return ONLY a JSON array of actions.\n"
+        "You are the Verification sub-agent.\n"
+        "Run ERC/DRC, analyze errors, and propose targeted fixes.\n"
+        "Use MOVE_COMPONENT for overlap/edge/clearance spacing issues.\n"
+        "Use DELETE_TRACKS + AUTOROUTE_BOARD for shorts/crossings when routing exists.\n"
+        "Use DEFINE_NET/ASSIGN_NETS for connectivity issues.\n"
+        "End fix sets with RUN_DRC or RUN_ERC to verify.\n"
+        "Parameter schema (use exactly these keys; do not use aliases like 'id'):\n"
+        "- MOVE_COMPONENT.parameters = {\"ref\":\"U1\",\"strategy\":\"resolve_overlap\"} OR {\"ref\":\"U1\",\"location\":{\"x\":10.0,\"y\":20.0}}\n"
+        "- ROTATE_COMPONENT.parameters = {\"ref\":\"U1\",\"angle\":90}\n"
+        "Return JSON array only.\n"
     )
 
     def __init__(self, llm_client=None):
@@ -60,52 +54,52 @@ class VerificationAgent(SubAgent):
         board_snapshot: Optional[Dict[str, Any]] = None,
     ) -> SubAgentResult:
         from ..design_agent import DesignAction, DesignActionType
+        from ...llm.client import LLMError
 
-        # If we have DRC/ERC results in context, analyse them.
-        errors = context.get("drc_errors") or context.get("erc_errors") or ""
-        if errors:
-            fixes = self._analyse_errors(str(errors))
-            if fixes:
-                return SubAgentResult(
-                    message=f"Proposing {len(fixes)} fix(es) for verification errors.",
-                    actions=fixes,
-                    confidence=0.8,
-                    thinking=f"Analysed errors → {len(fixes)} fixes",
-                )
+        if not self._llm_available():
+            raise LLMError("verification: LLM is required but is not available/configured.")
 
-        # LLM-backed planning.
-        if self._llm_available():
-            raw = self._llm_chat(self._build_prompt(goal, context, board_snapshot))
-            actions = self._parse_actions(raw)
-            if actions:
-                return SubAgentResult(
-                    message=f"Proposing {len(actions)} verification action(s).",
-                    actions=actions,
-                    confidence=0.85,
-                )
+        raw = self._llm_chat(self._build_prompt(goal, context, board_snapshot))
+        actions = self._parse_actions(raw)
+        if actions:
+            return SubAgentResult(
+                message=f"Proposing {len(actions)} verification action(s).",
+                actions=actions,
+                confidence=0.85,
+            )
 
-        # Fallback: just run DRC.
         return SubAgentResult(
-            message="Running DRC to check the design.",
-            actions=[
-                DesignAction(
-                    action_type=DesignActionType.RUN_DRC,
-                    description="Run Design Rule Check",
-                    parameters={},
-                    requires_approval=False,
-                ),
-            ],
-            confidence=0.7,
+            message="No verification actions proposed.",
+            actions=[],
+            confidence=0.3,
+            phase_complete=False,
+            thinking="LLM proposed no verification actions",
         )
 
     # ── Error analysis ──────────────────────────────────────────
 
-    def _analyse_errors(self, error_text: str) -> list:
+    def _analyse_errors(self, error_text: str, board_snapshot: Optional[Dict[str, Any]] = None) -> list:
         """Parse DRC/ERC error text and return targeted fix actions."""
         from ..design_agent import DesignAction, DesignActionType
 
         lower = error_text.lower()
         fixes: list = []
+
+        # Heuristics from board state (when available). If we don't have a
+        # snapshot, keep legacy behavior (assume routing may exist).
+        has_routing = True
+        can_autoroute = True
+        if board_snapshot is not None:
+            try:
+                tracks = int(board_snapshot.get("tracks_count") or 0)
+                vias = int(board_snapshot.get("vias_count") or 0)
+                has_routing = (tracks + vias) > 0 or bool(board_snapshot.get("routing_attempted"))
+            except Exception:
+                has_routing = bool(board_snapshot.get("routing_attempted"))
+            try:
+                can_autoroute = bool(board_snapshot.get("outline_defined")) and int(board_snapshot.get("nets_assigned") or 0) > 0
+            except Exception:
+                can_autoroute = bool(board_snapshot.get("outline_defined"))
 
         # Courtyard overlap — extract refs if possible.
         if "courtyard" in lower and "overlap" in lower:
@@ -118,8 +112,8 @@ class VerificationAgent(SubAgent):
                     requires_approval=True,
                 ))
 
-        # Board edge clearance.
-        if "board edge" in lower or "edge clearance" in lower:
+        # Board edge clearance / silkscreen clipping.
+        if "board edge" in lower or "edge clearance" in lower or "silkscreen clipped" in lower:
             refs = self._extract_refs(error_text)
             for ref in refs[:4]:
                 fixes.append(DesignAction(
@@ -129,20 +123,46 @@ class VerificationAgent(SubAgent):
                     requires_approval=True,
                 ))
 
-        # Short circuit / track crossing.
-        if "short" in lower or "crossing" in lower or "clearance violation" in lower:
-            fixes.append(DesignAction(
-                action_type=DesignActionType.DELETE_TRACKS,
-                description="Delete all tracks to clear shorts/crossings",
-                parameters={},
-                requires_approval=True,
-            ))
-            fixes.append(DesignAction(
-                action_type=DesignActionType.AUTOROUTE_BOARD,
-                description="Re-route the board after clearing tracks",
-                parameters={},
-                requires_approval=True,
-            ))
+        # Hole clearance issues usually mean duplicated/overlapping holes or
+        # footprints packed too tightly. Prefer spacing fixes.
+        if "hole clearance" in lower or "drilled hole" in lower:
+            refs = self._extract_refs(error_text)
+            for ref in refs[:4]:
+                fixes.append(DesignAction(
+                    action_type=DesignActionType.MOVE_COMPONENT,
+                    description=f"Move {ref} to fix hole/keepout clearance",
+                    parameters={"ref": ref, "strategy": "resolve_overlap"},
+                    requires_approval=True,
+                ))
+
+        # Short circuit / track crossing: only delete/re-route when routing exists.
+        if "short" in lower or "crossing" in lower:
+            if has_routing:
+                fixes.append(DesignAction(
+                    action_type=DesignActionType.DELETE_TRACKS,
+                    description="Delete all tracks to clear shorts/crossings",
+                    parameters={},
+                    requires_approval=True,
+                ))
+                if can_autoroute:
+                    fixes.append(DesignAction(
+                        action_type=DesignActionType.AUTOROUTE_BOARD,
+                        description="Re-route the board after clearing tracks",
+                        parameters={},
+                        requires_approval=True,
+                    ))
+
+        # Clearance violations are ambiguous (tracks vs. footprints). If we
+        # don't have routing yet, treat them as placement spacing issues.
+        if "clearance violation" in lower and not has_routing:
+            refs = self._extract_refs(error_text)
+            for ref in refs[:4]:
+                fixes.append(DesignAction(
+                    action_type=DesignActionType.MOVE_COMPONENT,
+                    description=f"Move {ref} to improve clearance",
+                    parameters={"ref": ref, "strategy": "resolve_overlap"},
+                    requires_approval=True,
+                ))
 
         # Missing connections.
         if "missing connection" in lower or "unconnected" in lower:
@@ -200,16 +220,19 @@ class VerificationAgent(SubAgent):
 
     def _parse_actions(self, raw: str) -> list:
         from ..design_agent import DesignAction, DesignActionType
+        from ...llm.client import LLMError
         if not raw:
-            return []
+            raise LLMError("verification: empty LLM response.")
         try:
             start = raw.find("[")
             end = raw.rfind("]") + 1
             if start < 0 or end <= start:
-                return []
+                raise LLMError("verification: expected a JSON array.")
             items = json.loads(raw[start:end])
-        except Exception:
-            return []
+        except LLMError:
+            raise
+        except Exception as e:
+            raise LLMError(f"verification: failed to parse JSON array: {e}") from e
 
         type_map = {
             "RUN_DRC": DesignActionType.RUN_DRC,
@@ -223,15 +246,18 @@ class VerificationAgent(SubAgent):
         actions: list = []
         for item in items:
             if not isinstance(item, dict):
-                continue
+                raise LLMError("verification: each action must be an object.")
             atype_str = str(item.get("action_type", "")).upper()
             atype = type_map.get(atype_str)
             if atype is None:
-                continue
+                raise LLMError(f"verification: unknown action_type: {atype_str!r}")
+            params = item.get("parameters") or {}
+            if not isinstance(params, dict):
+                raise LLMError(f"verification: parameters must be an object for {atype.name}.")
             actions.append(DesignAction(
                 action_type=atype,
                 description=str(item.get("description", "")),
-                parameters=item.get("parameters") or {},
+                parameters=params,
                 requires_approval=(atype not in {DesignActionType.RUN_DRC, DesignActionType.RUN_ERC}),
             ))
         return actions

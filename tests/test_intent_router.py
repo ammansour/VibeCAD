@@ -30,17 +30,19 @@ class TestIntentRouter(unittest.TestCase):
 
     def test_fallback_question_mark(self):
         from vibecad.design.intent_router import decide_route
+        from vibecad.llm.client import LLMError
 
         llm = self._FakeLLM("", available=False)
-        out = decide_route(llm, "What value for R1?")
-        self.assertEqual(out.route, "qa")
+        with self.assertRaises(LLMError):
+            decide_route(llm, "What value for R1?")
 
     def test_fallback_default(self):
         from vibecad.design.intent_router import decide_route
+        from vibecad.llm.client import LLMError
 
         llm = self._FakeLLM("", available=False)
-        out = decide_route(llm, "Place U1 near the connector")
-        self.assertEqual(out.route, "agent")
+        with self.assertRaises(LLMError):
+            decide_route(llm, "Place U1 near the connector")
 
 
 if __name__ == "__main__":

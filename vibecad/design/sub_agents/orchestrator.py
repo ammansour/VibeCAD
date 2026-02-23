@@ -28,6 +28,8 @@ from .verification import VerificationAgent
 
 logger = logging.getLogger(__name__)
 
+_SUBAGENT_LLM_RETRIES = 2  # initial try + 1 repair attempt
+
 
 class DesignPhase(Enum):
     """High-level phases of the design pipeline."""
@@ -127,10 +129,61 @@ class Orchestrator:
             self._phase.name, agent_name, attempts,
         )
 
-        result = agent.plan(phase_goal, context, board_snapshot)
+        # Subagents are strict about JSON schema. If the LLM emits malformed JSON
+        # or unknown action types, retry once with explicit feedback rather than
+        # aborting the whole AgentLoop. If it still fails, return no actions so
+        # AgentLoop can fall through to the monolithic LLM (still LLM-driven).
+        try:
+            from ...llm.client import LLMError
+        except Exception:  # pragma: no cover
+            LLMError = Exception  # type: ignore
+
+        last_err: Optional[Exception] = None
+        result: Optional[SubAgentResult] = None
+        for retry_idx in range(_SUBAGENT_LLM_RETRIES):
+            try:
+                result = agent.plan(phase_goal, context, board_snapshot)
+                last_err = None
+                break
+            except LLMError as e:  # type: ignore[misc]
+                last_err = e
+                logger.warning(
+                    "Orchestrator: subagent=%s phase=%s failed (LLM/format) retry=%d/%d: %s",
+                    agent_name, self._phase.name, retry_idx + 1, _SUBAGENT_LLM_RETRIES, e,
+                )
+                if retry_idx + 1 >= _SUBAGENT_LLM_RETRIES:
+                    break
+
+                # Add explicit validation feedback to steer the next response.
+                allowed = ""
+                try:
+                    if getattr(agent, "SYSTEM_PROMPT", ""):
+                        allowed = "Follow your system prompt exactly."
+                except Exception:
+                    allowed = ""
+                repair_feedback = "\n".join(
+                    p for p in [
+                        (feedback or "").strip(),
+                        f"SUBAGENT_OUTPUT_INVALID: {e}",
+                        "Return ONLY a JSON array. Do not wrap it in an object or markdown.",
+                        "Every element must be an object with non-empty 'action_type', 'description', and 'parameters'.",
+                        allowed or "",
+                    ] if p
+                ).strip()
+                phase_goal = self._build_phase_goal(goal, repair_feedback)
+
+        if result is None:
+            msg = f"Subagent '{agent_name}' failed to produce a valid plan: {last_err}"
+            return SubAgentResult(
+                message=msg,
+                actions=[],
+                confidence=0.0,
+                phase_complete=False,
+                thinking=str(last_err or msg),
+            )
 
         # If the subagent says its phase is done, advance.
-        if result.phase_complete:
+        if result and result.phase_complete:
             self._advance()
 
         return result
@@ -219,7 +272,11 @@ class Orchestrator:
                 self._phase_attempts[DesignPhase.OUTLINE] = 0
 
         elif self._phase == DesignPhase.OUTLINE:
-            if snap.get("board_width") and snap.get("board_height"):
+            # Prefer the loop's explicit phase tracking when available.
+            # AgentLoop reliably sets outline_defined=True after a successful
+            # DEFINE_BOARD_OUTLINE action, even when board dimension keys are
+            # absent from the context snapshot.
+            if snap.get("outline_defined") or (snap.get("board_width") and snap.get("board_height")):
                 self._phase = DesignPhase.ARRANGE
                 self._phase_attempts[DesignPhase.ARRANGE] = 0
             elif attempts >= 3:
@@ -264,34 +321,28 @@ class Orchestrator:
         """Prepend phase-specific instructions to the user's goal."""
         phase_hints = {
             DesignPhase.GATHER: (
-                "PHASE: GATHER — Identify and search for all components needed.\n"
+                "PHASE: GATHER — Find missing parts and required datasheets.\n"
             ),
             DesignPhase.PLACE: (
-                "PHASE: PLACE — Add components to the board.  Specify package "
-                "explicitly (e.g. DIP-28, TQFP-32).  Do not add more than 10 at a time.\n"
+                "PHASE: PLACE — Add components with explicit package names.\n"
             ),
             DesignPhase.OUTLINE: (
-                "PHASE: OUTLINE — Define the board outline and mounting holes.  "
-                "Size it with ≥20% margin beyond the total component area.\n"
+                "PHASE: OUTLINE — Define board outline (and mounting holes if needed).\n"
             ),
             DesignPhase.ARRANGE: (
-                "PHASE: ARRANGE — Move all components inside the board outline.  "
-                "Use the spatial strategy: ICs centre, connectors at edges, "
-                "passives near their parent IC. Ensure ≥2 mm clearance between all parts.\n"
+                "PHASE: ARRANGE — Move parts inside outline and clear overlaps.\n"
             ),
             DesignPhase.NET_ASSIGN: (
-                "PHASE: NET_ASSIGN — Assign nets to all pads.  Start with power "
-                "nets (GND, VCC), then signal nets (SDA, SCL, TX, RX, etc.).\n"
+                "PHASE: NET_ASSIGN — Assign power nets first, then signal nets.\n"
             ),
             DesignPhase.ROUTE: (
-                "PHASE: ROUTE — Route copper traces for all assigned nets.\n"
+                "PHASE: ROUTE — Route assigned nets.\n"
             ),
             DesignPhase.VERIFY: (
-                "PHASE: VERIFY — Run DRC and ERC.  Analyse any errors.\n"
+                "PHASE: VERIFY — Run ERC/DRC and review errors.\n"
             ),
             DesignPhase.FIX: (
-                "PHASE: FIX — Fix DRC/ERC errors.  Move overlapping components, "
-                "delete and re-route shorted tracks, fix missing connections.\n"
+                "PHASE: FIX — Apply targeted fixes, then re-run checks.\n"
             ),
             DesignPhase.DONE: "The design is complete.",
         }

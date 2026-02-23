@@ -23,6 +23,20 @@ from vibecad.design.sub_agents.verification import VerificationAgent
 from vibecad.design.sub_agents.orchestrator import Orchestrator, DesignPhase
 
 
+class _FakeResponse:
+    def __init__(self, content: str):
+        self.content = content
+
+
+class _FakeLLM:
+    def __init__(self, content: str = "[]", *, available: bool = True):
+        self.is_available = available
+        self._content = content
+
+    def chat(self, messages, system_prompt=None):
+        return _FakeResponse(self._content)
+
+
 # ---------------------------------------------------------------------------
 # BBox spatial helpers
 # ---------------------------------------------------------------------------
@@ -240,15 +254,18 @@ class TestEstimateBoardSize(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestInfoGatheringAgent(unittest.TestCase):
-    def test_fallback_extraction(self):
-        agent = InfoGatheringAgent()
-        result = agent.plan("I need an ATmega328P and a LM7805", {})
-        self.assertGreater(len(result.actions), 0)
-        types = {a.action_type for a in result.actions}
-        self.assertIn(DesignActionType.SEARCH_PART, types)
+    def test_llm_plan_parses_actions(self):
+        llm = _FakeLLM(
+            '[{"action_type":"SEARCH_PART","description":"Search for ATmega328P","parameters":{"query":"ATmega328P"}}]'
+        )
+        agent = InfoGatheringAgent(llm_client=llm)
+        result = agent.plan("I need an ATmega328P", {})
+        self.assertEqual(len(result.actions), 1)
+        self.assertEqual(result.actions[0].action_type, DesignActionType.SEARCH_PART)
+        self.assertEqual(result.actions[0].parameters.get("query"), "ATmega328P")
 
     def test_no_components_detected(self):
-        agent = InfoGatheringAgent()
+        agent = InfoGatheringAgent(llm_client=_FakeLLM("[]"))
         result = agent.plan("hello world", {})
         self.assertTrue(result.phase_complete or len(result.actions) == 0)
 
@@ -257,27 +274,18 @@ class TestInfoGatheringAgent(unittest.TestCase):
         self.assertIn(DesignActionType.SEARCH_PART, agent.HANDLED_ACTION_TYPES)
         self.assertIn(DesignActionType.SEARCH_WEB, agent.HANDLED_ACTION_TYPES)
 
-    def test_fallback_extracts_arduino_uno(self):
-        """High-level board names like 'arduino uno' should be extracted."""
-        agent = InfoGatheringAgent()
-        result = agent.plan("design arduino uno", {})
-        self.assertGreater(len(result.actions), 0)
-        queries = [a.parameters.get("query", "").lower() for a in result.actions]
-        self.assertTrue(any("arduino" in q for q in queries))
-
-    def test_fallback_extracts_esp32(self):
-        agent = InfoGatheringAgent()
-        result = agent.plan("I want an ESP32 devkit board", {})
-        self.assertGreater(len(result.actions), 0)
-        queries = [a.parameters.get("query", "").lower() for a in result.actions]
-        self.assertTrue(any("esp32" in q for q in queries))
-
-    def test_fallback_extracts_quoted_names(self):
-        agent = InfoGatheringAgent()
-        result = agent.plan('I need a "TPS63020" for power', {})
-        self.assertGreater(len(result.actions), 0)
-        queries = [a.parameters.get("query", "") for a in result.actions]
-        self.assertTrue(any("TPS63020" in q for q in queries))
+    def test_extract_primary_goal_text_ignores_feedback(self):
+        wrapped = (
+            "PHASE: GATHER — Find missing parts and required datasheets.\n"
+            "USER GOAL: build arduino uno from scratch\n"
+            "FEEDBACK FROM PREVIOUS STEP:\n"
+            "[SEARCH_PART] OK: found Package_DIP:DIP-28...\n"
+            "[SEARCH_PART] OK: found ESP32-WROOM-32...\n"
+        )
+        self.assertEqual(
+            InfoGatheringAgent._extract_primary_goal_text(wrapped),
+            "build arduino uno from scratch",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -291,16 +299,20 @@ class TestRoutingAgent(unittest.TestCase):
         self.assertIn(DesignActionType.AUTOROUTE_BOARD, agent.HANDLED_ACTION_TYPES)
         self.assertNotIn(DesignActionType.ADD_COMPONENT, agent.HANDLED_ACTION_TYPES)
 
-    def test_plan_without_llm(self):
+    def test_plan_without_llm_raises(self):
+        from vibecad.llm.client import LLMError
         agent = RoutingAgent()
-        result = agent.plan("route everything", {})
-        self.assertIsInstance(result, SubAgentResult)
+        with self.assertRaises(LLMError):
+            agent.plan("route everything", {})
 
-    def test_plan_without_llm_sets_phase_complete(self):
-        """When routing can't produce actions, it should signal phase complete."""
-        agent = RoutingAgent()
+    def test_plan_with_llm_parses_actions(self):
+        llm = _FakeLLM(
+            '[{"action_type":"AUTOROUTE_BOARD","description":"Autoroute","parameters":{}}]'
+        )
+        agent = RoutingAgent(llm_client=llm)
         result = agent.plan("route everything", {})
-        self.assertTrue(result.phase_complete)
+        self.assertEqual(len(result.actions), 1)
+        self.assertEqual(result.actions[0].action_type, DesignActionType.AUTOROUTE_BOARD)
 
 
 # ---------------------------------------------------------------------------
@@ -313,29 +325,27 @@ class TestVerificationAgent(unittest.TestCase):
         self.assertIn(DesignActionType.RUN_DRC, agent.HANDLED_ACTION_TYPES)
         self.assertIn(DesignActionType.RUN_ERC, agent.HANDLED_ACTION_TYPES)
 
-    def test_fallback_runs_drc(self):
+    def test_plan_without_llm_raises(self):
+        from vibecad.llm.client import LLMError
         agent = VerificationAgent()
-        result = agent.plan("check the board", {})
-        self.assertGreater(len(result.actions), 0)
-        self.assertEqual(result.actions[0].action_type, DesignActionType.RUN_DRC)
+        with self.assertRaises(LLMError):
+            agent.plan("check the board", {})
 
     def test_analyse_courtyard_errors(self):
-        agent = VerificationAgent()
+        agent = VerificationAgent(llm_client=_FakeLLM("[]"))
         result = agent.plan("fix errors", {
             "drc_errors": "Courtyard overlap between U1 and C2. Board edge clearance violation at R3."
         })
-        types = {a.action_type for a in result.actions}
-        self.assertIn(DesignActionType.MOVE_COMPONENT, types)
-        self.assertIn(DesignActionType.RUN_DRC, types)
+        # No deterministic fix synthesis: VerificationAgent should rely on LLM output.
+        self.assertEqual(result.actions, [])
 
     def test_analyse_short_errors(self):
-        agent = VerificationAgent()
+        agent = VerificationAgent(llm_client=_FakeLLM("[]"))
         result = agent.plan("fix errors", {
             "drc_errors": "Short circuit between GND and VCC on track segment"
         })
-        types = {a.action_type for a in result.actions}
-        self.assertIn(DesignActionType.DELETE_TRACKS, types)
-        self.assertIn(DesignActionType.AUTOROUTE_BOARD, types)
+        # No deterministic fix synthesis: VerificationAgent should rely on LLM output.
+        self.assertEqual(result.actions, [])
 
     def test_extract_refs(self):
         refs = VerificationAgent._extract_refs(
@@ -367,7 +377,7 @@ class TestOrchestrator(unittest.TestCase):
         self.assertEqual(orch.phase, DesignPhase.GATHER)
 
     def test_step_returns_result(self):
-        orch = Orchestrator()
+        orch = Orchestrator(llm_client=_FakeLLM("[]"))
         result = orch.step("design an Arduino UNO", {})
         self.assertIsInstance(result, SubAgentResult)
 
@@ -376,14 +386,6 @@ class TestOrchestrator(unittest.TestCase):
         self.assertIsInstance(orch.get_agent("placement"), PlacementAgent)
         self.assertIsInstance(orch.get_agent("routing"), RoutingAgent)
         self.assertIsNone(orch.get_agent("nonexistent"))
-
-    def test_gather_phase_fallback_extract(self):
-        orch = Orchestrator()
-        result = orch.step("I need ATmega328P-PU and USB-C connector", {})
-        # Info gathering should produce SEARCH_PART actions.
-        if result.actions:
-            types = {a.action_type for a in result.actions}
-            self.assertIn(DesignActionType.SEARCH_PART, types)
 
     def test_placement_optimization_convenience(self):
         comps = [
@@ -398,14 +400,14 @@ class TestOrchestrator(unittest.TestCase):
 
     def test_phase_auto_advance_gather(self):
         """After 3 gather attempts, orchestrator should advance to PLACE."""
-        orch = Orchestrator()
+        orch = Orchestrator(llm_client=_FakeLLM("[]"))
         for _ in range(4):
             orch.step("design a board", {})
         self.assertNotEqual(orch.phase, DesignPhase.GATHER)
 
     def test_place_phase_advances_without_components(self):
         """PLACE phase must not loop forever when no components are placed."""
-        orch = Orchestrator()
+        orch = Orchestrator(llm_client=_FakeLLM("[]"))
         orch.advance_to(DesignPhase.PLACE)
         # Simulate 6 attempts in PLACE with empty board snapshot
         for _ in range(6):
@@ -413,11 +415,19 @@ class TestOrchestrator(unittest.TestCase):
         # Should have advanced past PLACE
         self.assertNotEqual(orch.phase, DesignPhase.PLACE)
 
+    def test_outline_phase_advances_when_outline_defined(self):
+        """OUTLINE phase should advance as soon as the outline is defined."""
+        orch = Orchestrator()
+        orch.advance_to(DesignPhase.OUTLINE)
+        orch._maybe_advance_phase({}, {"outline_defined": True}, None)
+        self.assertEqual(orch.phase, DesignPhase.ARRANGE)
+
     def test_placement_fallback_sets_phase_complete(self):
-        """PlacementAgent without LLM should set phase_complete."""
+        """PlacementAgent requires an LLM."""
+        from vibecad.llm.client import LLMError
         agent = PlacementAgent()
-        result = agent.plan("place all components", {})
-        self.assertTrue(result.phase_complete)
+        with self.assertRaises(LLMError):
+            agent.plan("place all components", {})
 
 
 # ---------------------------------------------------------------------------
@@ -462,8 +472,16 @@ class TestPlacementPromptHandoff(unittest.TestCase):
                 "components": [],
                 "search_part_results": {
                     "arduino uno": [
-                        {"name": "ATmega328P-PU", "package": "DIP-28"},
-                        {"name": "Crystal 16MHz", "package": "HC49"},
+                        {
+                            "name": "MCU_Microchip_ATmega:ATmega328P-PU",
+                            "package": "DIP-28",
+                            "is_footprint_candidate": True,
+                        },
+                        {
+                            "name": "Crystal:Crystal_HC49-U_Vertical",
+                            "package": "HC49",
+                            "is_footprint_candidate": True,
+                        },
                     ]
                 },
             },

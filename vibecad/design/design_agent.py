@@ -105,6 +105,127 @@ class DesignAction:
         }
 
 
+def normalize_action_parameters(action_type: 'DesignActionType', parameters: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize action parameter keys to the canonical schema.
+
+    Goal: every action has one canonical key per concept (e.g. component reference is
+    always under 'ref', never 'id' / 'reference' / etc).
+    """
+    params: Dict[str, Any] = dict(parameters or {})
+
+    def _pop_first(keys: tuple) -> Any:
+        for k in keys:
+            if k in params and params.get(k) not in (None, ""):
+                val = params.get(k)
+                if k != keys[0]:
+                    params.pop(k, None)
+                return val
+        return None
+
+    def _normalize_ref() -> None:
+        ref_val = _pop_first(("ref", "id", "reference", "designator", "component"))
+        if ref_val is not None:
+            ref = str(ref_val).strip()
+            if ref:
+                params["ref"] = ref
+        # Ensure aliases are removed if present.
+        for k in ("id", "reference", "designator", "component"):
+            params.pop(k, None)
+
+    def _normalize_location() -> None:
+        # Promote x/y into a single location object.
+        if params.get("location") in (None, ""):
+            if "x" in params and "y" in params:
+                params["location"] = {"x": params.pop("x"), "y": params.pop("y")}
+            elif "x_mm" in params and "y_mm" in params:
+                params["location"] = {"x": params.pop("x_mm"), "y": params.pop("y_mm")}
+            elif "pos" in params:
+                params["location"] = params.pop("pos")
+            elif "at" in params:
+                params["location"] = params.pop("at")
+
+        loc = params.get("location")
+        if isinstance(loc, (list, tuple)) and len(loc) == 2:
+            params["location"] = {"x": loc[0], "y": loc[1]}
+        elif isinstance(loc, str):
+            m = re.match(r"^\s*\(?\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)?\s*$", loc.strip())
+            if m:
+                params["location"] = {"x": float(m.group(1)), "y": float(m.group(2))}
+
+        # If we now have a dict, try to coerce numeric x/y.
+        loc2 = params.get("location")
+        if isinstance(loc2, dict) and "x" in loc2 and "y" in loc2:
+            try:
+                params["location"] = {"x": float(loc2["x"]), "y": float(loc2["y"])}
+            except Exception:
+                pass
+
+    def _normalize_refs_list() -> None:
+        # Canonical: "refs" is a list of reference strings (["U1","J1",...]).
+        refs = params.get("refs")
+        if isinstance(refs, str):
+            items = [r.strip().upper() for r in re.split(r"[,;\s]+", refs) if r.strip()]
+            params["refs"] = items
+            return
+        if isinstance(refs, list):
+            out: List[str] = []
+            for r in refs:
+                s = str(r or "").strip()
+                if not s:
+                    continue
+                out.append(s.upper())
+            params["refs"] = out
+            return
+
+    def _normalize_assign_nets() -> None:
+        # Canonical: {"assignments":[{"net":"GND","ref":"U1","pad":"3"}, ...]}
+        assigns = params.get("assignments")
+        if isinstance(assigns, list) and assigns:
+            return
+
+        # Common grouped encoding:
+        # {"net_name":"GND","pads":["U1:3","U1:5", ...]}
+        net = params.get("net") or params.get("net_name") or params.get("netName") or params.get("name")
+        pads = params.get("pads") or params.get("pad_refs") or params.get("padRefs")
+        if not (isinstance(net, str) and net.strip() and isinstance(pads, list) and pads):
+            return
+
+        net_s = str(net).strip()
+        normalized: List[Dict[str, Any]] = []
+        for p in pads:
+            s = str(p or "").strip()
+            if not s:
+                continue
+            m = re.match(r"^\s*([A-Za-z]+\d+)\s*[-/:]\s*([A-Za-z0-9]+)\s*$", s)
+            if not m:
+                continue
+            normalized.append({"net": net_s, "ref": m.group(1).upper(), "pad": m.group(2)})
+
+        if normalized:
+            params.pop("net_name", None)
+            params.pop("netName", None)
+            params.pop("pads", None)
+            params["assignments"] = normalized
+
+    if action_type in (
+        DesignActionType.MOVE_COMPONENT,
+        DesignActionType.ROTATE_COMPONENT,
+        DesignActionType.DELETE_COMPONENT,
+    ):
+        _normalize_ref()
+
+    if action_type in (DesignActionType.MOVE_COMPONENT, DesignActionType.ADD_COMPONENT):
+        _normalize_location()
+
+    if action_type == DesignActionType.ALIGN_COMPONENTS:
+        _normalize_refs_list()
+
+    if action_type == DesignActionType.ASSIGN_NETS:
+        _normalize_assign_nets()
+
+    return params
+
+
 @dataclass
 class DesignRequest:
     """A user's design request, potentially containing multiple actions."""
@@ -168,98 +289,26 @@ class DesignAgent:
     # *explanations only* (no modifications). For the design assistant we
     # provide a separate system prompt that allows proposing tool actions,
     # while still keeping execution gated by explicit user approval.
-    DESIGN_SYSTEM_PROMPT = """You are VibeCAD Design Assistant — an autonomous PCB design agent for KiCad.
+    DESIGN_SYSTEM_PROMPT = """You are VibeCAD Design Assistant for KiCad.
 
-Your job:
-- Help the user design PCBs from scratch or modify existing designs.
-- ONLY do exactly what the user asks. Do NOT assume additional steps.
-- If the user says "draw a board outline", ONLY propose DEFINE_BOARD_OUTLINE. Do NOT add components, mounting holes, routing, or any other actions unless explicitly requested.
-- When given an explicit high-level goal (e.g., "design an Arduino UNO" or "design a full board"), THEN break it down into phases:
-  1. Component selection & search (SEARCH_PART for each component)
-  2. Component placement (ADD_COMPONENT for each — ALWAYS specify the package parameter, e.g. package:"DIP-28", package:"TQFP-32", package:"SOT-223")
-  3. Board outline (DEFINE_BOARD_OUTLINE — size it generously for the components)
-  4. Layout arrangement: use MOVE_COMPONENT and ROTATE_COMPONENT to position all components INSIDE the board outline. No component should extend beyond the board edges. Space them logically (e.g., connectors at edges, ICs centered, decoupling caps near their ICs).
-  5. Net assignment (DEFINE_NET / ASSIGN_NETS for ALL critical nets — GND, VCC, signal nets, data buses, crystal, reset, etc.)
-  6. Routing (AUTOROUTE_BOARD)
-  7. ERC verification (RUN_ERC) — fix any electrical rule violations
-  8. DRC verification (RUN_DRC) — fix any design rule violations
+Core behavior:
+- Propose actions only; never execute.
+- Do only what the user asked.
+- If request is high-level, use this order: SEARCH_PART -> ADD_COMPONENT -> DEFINE_BOARD_OUTLINE -> MOVE/ROTATE/ALIGN -> DEFINE_NET/ASSIGN_NETS -> ROUTE -> RUN_ERC -> RUN_DRC.
+- Ask a clarifying question and return no actions when required inputs are missing.
 
-PHASE COMPLETION CHECKPOINTS (mandatory before advancing):
-- After Phase 2: Verify ALL components from Phase 1 have been placed. If any are missing, place them before continuing.
-- For "design an Arduino UNO": Do NOT place footprints/modules named like Arduino_UNO_R2/Arduino_UNO_R3. Those represent a pre-made board/module footprint and can cause severe DRC issues (including co-located drills). Instead, place discrete headers (PinHeader footprints) and the actual ICs/connectors.
-- After Phase 3: Verify the board outline is large enough for all components. A good rule: at least 20% margin beyond the component area.
-- After Phase 4: Verify ALL component centers are within the board outline. If any are outside, move them inside.
-- After Phase 5: Verify net assignment success. If DEFINE_NET/ASSIGN_NETS reports "pad not found" warnings, the footprint likely has wrong pin count — consider removing and re-adding the component with an explicit package (e.g., "ATmega328P-PU" with package:"DIP-28"). Do NOT proceed to routing with >30% net assignment failures.
-- After Phase 6: If AUTOROUTE_BOARD reports "Could not route N net(s)", do NOT proceed to DRC. Instead, fix the unroutable nets by checking net assignments and re-routing.
-
-- IMPORTANT: ALL components MUST be moved within the board outline BEFORE routing. Do NOT route while components are outside or overlapping the board edge.
-- Execute one phase at a time. After each phase completes, verify the checkpoint, then propose the next.
-- Ask clarifying questions when required inputs are ambiguous.
-- Prefix internal reasoning with [THINKING] so the user sees your progress.
-
-Safety rules:
-- Never execute actions yourself — propose them and the host app will preview/execute.
-- The host app requires explicit user approval before executing any board-modifying action.
-- Do not invent PCB coordinates. Prefer references (e.g., U1), pins/pads, nets, and standard package names.
-- When placing components, use relative positions (e.g., "next to U1") or let the host auto-place at board center.
-- For DEFINE_BOARD_OUTLINE: The host app automatically centers the outline on the A4 page (~150,100mm).
-  You MUST NOT mention origin, (0,0), starting point, or top-left corner in your reasoning or response.
-  The ONLY parameters are width and height. Do NOT say "I'll set the origin" — there is no origin parameter.
-
-Layer guidance:
-- For 2-layer boards: use F.Cu (front copper) and B.Cu (back copper).
-- For 4-layer boards: use In1.Cu for ground plane and In2.Cu for power plane.
-- Use SET_LAYER_COUNT to change the number of copper layers.
-- Use ADD_POLYGON on inner layers to create copper pour zones (ground/power planes).
-
-Routing rules:
-- All tracks must be routed along cardinal directions (horizontal/vertical) or at 45-degree diagonals.
-- Never route arbitrary-angle traces. The host enforces this automatically.
-
-Connectivity prerequisite:
-- Do NOT attempt routing (DRAW_TRACK/AUTOROUTE_BOARD) until pads have nets assigned.
-- If pads are unconnected (autorouter reports "No routable nets found"), you MUST propose either:
-    1) DEFINE_NET to assign a net to multiple pads at once, OR
-    2) ASSIGN_NETS with explicit ref/pad → net mappings, OR
-    3) instruct the user to run KiCad's "Update PCB from Schematic" to import the netlist,
-    then retry AUTOROUTE_BOARD.
-- CRITICAL: If DEFINE_NET or ASSIGN_NETS reports "pad not found" with available pad list, the footprint has fewer pins than expected. This means the wrong footprint was placed. You MUST:
-    1) DELETE_COMPONENT to remove the wrong-footprint component
-    2) Re-add it with ADD_COMPONENT and specify the correct package explicitly (e.g. package:"DIP-28")
-    3) Re-try net assignments
-    Do NOT proceed to routing if pad assignments are failing.
-
-Large / complex boards:
-- Work in batches. Propose at most ~10 ADD_COMPONENT actions per iteration.
-- After each batch, verify progress (components placed count, nets assigned ratio) and continue.
-- Use SEARCH_WEB and LOOKUP_DATASHEET to get pinout info, datasheets, and reference designs from LCSC/Mouser/Octopart. This is especially important for ICs where you need exact pin mappings.
-- If the schematic has few/no net labels, use SEARCH_WEB / LOOKUP_DATASHEET to pull pinout hints for key ICs/connectors, then use DEFINE_NET to name critical nets (GND, 5V, 3V3, USB_D+/D-, SPI, I2C) so routing can proceed.
-
-Placement rules:
-- The placement engine automatically avoids overlaps using bounding-box collision detection, but the LLM's MOVE_COMPONENT commands can still create overlaps. Always check the response for overlap warnings after MOVE_COMPONENT.
-- If MOVE_COMPONENT reports "WARNING: ... overlaps with ...", immediately move the overlapping component(s) to clear positions before proceeding.
-- After Phase 4 (Layout Arrangement), verify no overlap warnings exist before proceeding to net assignment.
-- For Arduino-style boards: place the DIP MCU in the center, connectors (USB, DC jack) on the left edge, and headers on the top/bottom edges. Space them by at least 15mm center-to-center.
-- NEVER place a regulator as ref J* — voltage regulators should be U* (e.g. U2, U3). Only connectors use J*.
-
-DRC iteration:
-- After running DRC, analyze each error and propose specific fixes.
-- For shorts / crossings (e.g., "Items shorting two nets" or "Tracks crossing"): use DELETE_TRACKS to remove existing routing, then re-route the correct nets (DRAW_TRACK/AUTOROUTE_BOARD). Do NOT move components for these errors.
-- For wrong connectivity (e.g., LED cathode accidentally on +5V): fix by changing which pads are connected and/or using ASSIGN_NETS, then re-route. Do NOT move components for connectivity mistakes.
-- For clearance / courtyard / solder-mask aperture bridge issues caused by proximity: MOVE_COMPONENT to increase spacing, then re-route, then re-run DRC.
-- For courtyard overlaps: use MOVE_COMPONENT to separate the overlapping components before re-routing.
-- Always re-run DRC after fixes. Repeat until no errors remain (warnings are acceptable).
-
-ERC iteration:
-- Run ERC (RUN_ERC) BEFORE DRC to catch electrical issues early (unconnected pins, missing power flags, pin-type conflicts).
-- Fix ERC errors using DEFINE_NET, ASSIGN_NETS, or by adding missing power symbols.
-- Re-run ERC after fixes. Proceed to DRC only when ERC passes.
-
-Completion:
-- Do NOT say DESIGN_COMPLETE until BOTH ERC and DRC report 0 errors.
-- When both pass with 0 errors, respond with DESIGN_COMPLETE.
-
-When you propose actions, you must follow the exact JSON schema requested by the user message.
+Hard rules:
+- Return strict JSON matching the caller schema.
+- Do not invent coordinates; prefer refs/pads/nets. Omit location when unknown.
+- Before proposing ADD_COMPONENT, run SEARCH_PART for the intended part/package and choose a concrete KiCad footprint identifier from the results.
+- When SEARCH_PART output includes FOOTPRINT_CANDIDATES_JSON, pick one of those exact strings for ADD_COMPONENT.parameters.query, or refine SEARCH_PART if none match.
+- ADD_COMPONENT.parameters.query MUST be a concrete KiCad footprint identifier (prefer "LibName:FootprintName") or an explicit package+pin-count footprint (e.g. "Package_QFP:TQFP-32_7x7mm_P0.8mm"). Do NOT put an MPN alone in ADD_COMPONENT.query.
+- If the footprint is not available locally, propose DOWNLOAD_FOOTPRINT (and DOWNLOAD_SYMBOL if needed) before ADD_COMPONENT.
+- For from-scratch board goals, avoid prebuilt module/shield footprints unless the user explicitly asks for a module/shield.
+- DEFINE_BOARD_OUTLINE only accepts width and height. Do not mention origin or 0,0.
+- Do not route before nets are assigned.
+- If net assignment says pad not found, replace the footprint (DELETE_COMPONENT + ADD_COMPONENT with correct package) before routing.
+- Report DESIGN_COMPLETE only when ERC and DRC both have 0 errors.
 """
 
     # Only advertise tools that the plugin can actually execute today.
@@ -536,25 +585,15 @@ When you propose actions, you must follow the exact JSON schema requested by the
             current_file=context.get('current_file'),
         )
 
-        # Prefer LLM for interpretation when configured. Local patterns remain
-        # as an offline fallback.
-        if self._llm_client:
-            actions = self._interpret_with_llm(user_input, context)
-            for a in actions:
-                request.add_action(a)
-            request.confidence = 0.9 if actions else 0.2
-        else:
-            action = self._interpret_locally(user_input)
-            if action and action.action_type != DesignActionType.UNKNOWN:
-                request.add_action(action)
-                request.confidence = 0.8
-            else:
-                request.add_action(DesignAction(
-                    action_type=DesignActionType.UNKNOWN,
-                    description=f"Could not understand: {user_input}",
-                    requires_approval=False,
-                ))
-                request.confidence = 0.0
+        from ..llm.client import LLMError
+
+        if not self._llm_client or not getattr(self._llm_client, "is_available", False):
+            raise LLMError("LLM is required for request interpretation but is not available/configured.")
+
+        actions = self._interpret_with_llm(user_input, context)
+        for a in actions:
+            request.add_action(a)
+        request.confidence = 0.9 if actions else 0.2
         
         return request
 
@@ -566,103 +605,30 @@ When you propose actions, you must follow the exact JSON schema requested by the
         """
         context = context or {}
 
-        # Deterministic shortcut: if the user asks to connect "pad N on each LED" and
-        # there are exactly two LEDs on the board, propose a concrete DRAW_TRACK action
-        # without asking for references.
-        m_each_led = re.search(
-            r"pads?\s+(?:numbered\s+)?(?P<pad>\w+)\s+on\s+each\s+led\b",
-            (user_input or ""),
-            flags=re.IGNORECASE,
+        from ..llm.client import LLMError
+        if not self._llm_client or not getattr(self._llm_client, "is_available", False):
+            raise LLMError("LLM is required for the design agent but is not available/configured.")
+
+        # Record the user's message before calling the LLM. `_chat_with_llm`
+        # will include prior turns to preserve multi-turn context.
+        self._append_history("user", user_input)
+        assistant_message, actions, confidence = self._chat_with_llm(user_input, context)
+
+        # Preflight: do not propose downloads we can't actually execute.
+        assistant_message, actions = self._preflight_actions(assistant_message, actions, context)
+        request = DesignRequest(
+            original_text=user_input,
+            active_editor=context.get('active_editor', 'pcb'),
+            current_file=context.get('current_file'),
+            confidence=confidence,
         )
-        if m_each_led:
-            pad = str(m_each_led.group('pad')).strip()
-            pcb_data = context.get('pcb_data')
-            led_refs: List[str] = []
-            try:
-                if pcb_data:
-                    for fp in getattr(pcb_data, 'footprints', []) or []:
-                        ref = str(getattr(fp, 'reference', '') or '').strip()
-                        val = str(getattr(fp, 'value', '') or '').strip().lower()
-                        if not ref:
-                            continue
-                        if ref.upper().startswith('D') or 'led' in val:
-                            led_refs.append(ref)
-            except Exception:
-                led_refs = []
+        for action in actions:
+            request.add_action(action)
+        if not assistant_message and actions:
+            assistant_message = "Got it. Here’s what I propose."
 
-            if len(led_refs) == 2:
-                ref_a, ref_b = led_refs[0], led_refs[1]
-                action = DesignAction(
-                    action_type=DesignActionType.DRAW_TRACK,
-                    description=f"Draw track from {ref_a} pad {pad} to {ref_b} pad {pad}",
-                    parameters={
-                        'from_point': f"{ref_a}/{pad}",
-                        'to_point': f"{ref_b}/{pad}",
-                    },
-                    requires_approval=True,
-                )
-                request = DesignRequest(
-                    original_text=user_input,
-                    active_editor=context.get('active_editor', 'pcb'),
-                    current_file=context.get('current_file'),
-                    confidence=0.85,
-                )
-                request.add_action(action)
-                return (
-                    f"I can draw a track between pad {pad} on {ref_a} and {ref_b}.",
-                    request,
-                )
-
-        if self._llm_client:
-            # Record the user's message before calling the LLM. `_chat_with_llm`
-            # will include prior turns to preserve multi-turn context.
-            self._append_history("user", user_input)
-            assistant_message, actions, confidence = self._chat_with_llm(user_input, context)
-
-            # Preflight: do not propose downloads we can't actually execute.
-            assistant_message, actions = self._preflight_actions(assistant_message, actions, context)
-            request = DesignRequest(
-                original_text=user_input,
-                active_editor=context.get('active_editor', 'pcb'),
-                current_file=context.get('current_file'),
-                confidence=confidence,
-            )
-            for action in actions:
-                request.add_action(action)
-            # Only show a hard failure message if we truly received nothing.
-            if not assistant_message and not actions:
-                # This typically happens when the LLM client returned an empty
-                # string (provider compatibility/config issue). Give the user a
-                # concrete next step rather than asking them to rephrase.
-                if bool((context or {}).get('verbose')):
-                    assistant_message = (
-                        "LLM returned an empty response (no assistant text and no actions). "
-                        "This usually indicates an API base/model compatibility issue. "
-                        "Try switching to a different model, or verify your `api_base` is an OpenAI-chat-compatible `/v1` endpoint."
-                    )
-                else:
-                    assistant_message = (
-                        "I didn’t get a response back from the LLM. "
-                        "Please check your API/model settings and try again."
-                    )
-            # If we did receive actions but the model omitted the assistant text,
-            # provide a friendly default.
-            if not assistant_message and actions:
-                assistant_message = "Got it. Here’s what I propose."
-
-            # Record assistant response for next-turn references.
-            self._append_history("assistant", self._assistant_history_text(assistant_message, actions))
-            return assistant_message, request
-
-        # Offline fallback: local intent patterns + template response.
-        request = self.interpret_request(user_input, context)
-        if request.interpreted_actions and request.interpreted_actions[0].action_type != DesignActionType.UNKNOWN:
-            assistant_message = "Here’s a proposed action for your approval."
-        else:
-            assistant_message = (
-                "I couldn’t understand that request. Try something like: "
-                "'find a USB-C connector', 'export BOM for JLCPCB', or 'connect U1 pin 1 to R1 pin 2'."
-            )
+        # Record assistant response for next-turn references.
+        self._append_history("assistant", self._assistant_history_text(assistant_message, actions))
         return assistant_message, request
 
     def _preflight_actions(self,
@@ -682,8 +648,250 @@ When you propose actions, you must follow the exact JSON schema requested by the
 
         safe_actions: List[DesignAction] = []
         missing: List[str] = []
+        malformed: List[str] = []
+
+        def _clean_component_query(text: str) -> str:
+            q = str(text or "").strip()
+            if not q:
+                return ""
+            q = re.sub(r"^[\"']|[\"']$", "", q).strip()
+            q = re.sub(
+                r"^(add|place|insert|use|put|mount)\s+",
+                "",
+                q,
+                flags=re.IGNORECASE,
+            ).strip()
+            q = re.sub(r"\b(component|footprint)\b", "", q, flags=re.IGNORECASE).strip()
+            q = re.sub(r"\s+", " ", q).strip(" .,:;")
+            return q
+
+        def _tokenize_for_match(text: str) -> List[str]:
+            s = str(text or "").lower()
+            s = s.replace("pinheader", "pin header")
+            s = re.sub(r"(\d+)\s*-\s*pin", r"\1 pin", s)
+            s = re.sub(r"\b1x0?(\d+)\b", r"\1 pin", s)
+            s = s.replace("-", " ")
+            return re.findall(r"[a-z0-9]+(?:mhz|khz|ghz)?", s)
+
+        def _best_search_query_hint(text: str) -> str:
+            store = context.get("search_part_results", {})
+            if not isinstance(store, dict) or not store:
+                return ""
+            target = set(_tokenize_for_match(text))
+            if not target:
+                return ""
+            best_query = ""
+            best_score = 0.0
+            for query in store.keys():
+                q_tokens = set(_tokenize_for_match(str(query)))
+                if not q_tokens:
+                    continue
+                overlap = len(target & q_tokens)
+                score = overlap / max(len(target), 1)
+                if score > best_score:
+                    best_score = score
+                    best_query = str(query).strip()
+            return best_query if best_score >= 0.45 else ""
+
+        def _looks_instruction_query(query: str) -> bool:
+            q = str(query or "").strip().lower()
+            if not q:
+                return True
+            return bool(re.match(r"^(add|place|insert|use|put|mount)\b", q))
 
         for a in actions:
+            # Normalize malformed component/net actions before execution.
+            if a.action_type == DesignActionType.ADD_COMPONENT:
+                params = dict(a.parameters or {})
+                raw_query = ""
+                for key in ("query", "part_name", "mpn", "part", "name"):
+                    value = params.get(key)
+                    if isinstance(value, str) and value.strip():
+                        raw_query = value.strip()
+                        break
+                # Some models send an explicit KiCad footprint identifier separately.
+                fp_hint = ""
+                for key in ("footprint", "footprint_id", "footprintId", "kicad_footprint", "kicadFootprint"):
+                    v = params.get(key)
+                    if isinstance(v, str) and v.strip():
+                        fp_hint = v.strip()
+                        break
+                desc = str(a.description or "").strip()
+                query = _clean_component_query(raw_query) if raw_query else ""
+                if not query:
+                    query = _clean_component_query(desc)
+                # If the model provided a concrete footprint hint, prefer it over a bare MPN.
+                if fp_hint:
+                    cleaned_fp = _clean_component_query(fp_hint)
+                    if ":" in cleaned_fp or re.search(r"\b(?:DIP|PDIP|QFN|DFN|TQFP|LQFP|SOIC|SOT|SSOP|TSSOP)\b", cleaned_fp, re.IGNORECASE):
+                        query = cleaned_fp
+                if _looks_instruction_query(query):
+                    inferred = _best_search_query_hint(query or desc)
+                    if inferred:
+                        query = inferred
+                if not query:
+                    malformed.append("ADD_COMPONENT missing usable query")
+                    logger.error(
+                        "Dropping malformed ADD_COMPONENT action: desc=%r params=%r",
+                        a.description, a.parameters
+                    )
+                    continue
+                if query != raw_query:
+                    logger.warning(
+                        "Normalized ADD_COMPONENT query from %r to %r",
+                        raw_query or desc, query
+                    )
+                params["query"] = query
+                a.parameters = params
+                safe_actions.append(a)
+                continue
+
+            if a.action_type == DesignActionType.DEFINE_NET:
+                params = dict(a.parameters or {})
+
+                # Accept common key variants.
+                if not str(params.get("net", "") or "").strip():
+                    for k in ("net_name", "netName", "name"):
+                        v = params.get(k)
+                        if isinstance(v, str) and v.strip():
+                            params["net"] = v.strip()
+                            break
+
+                # Support bulk net definitions: {"net_names":[...]}.
+                net_names = params.get("net_names") or params.get("netNames")
+                if isinstance(net_names, list) and net_names:
+                    for n in net_names:
+                        nn = str(n or "").strip()
+                        if not nn:
+                            continue
+                        safe_actions.append(DesignAction(
+                            action_type=DesignActionType.DEFINE_NET,
+                            description=(a.description or f"Define net {nn}").strip(),
+                            parameters={"net": nn, "pads": params.get("pads") or []},
+                            requires_approval=a.requires_approval,
+                        ))
+                    continue
+
+                # Pads are optional: DEFINE_NET can just create the net object.
+                pads = params.get("pads")
+                if pads is None:
+                    for k in ("pin_refs", "pin_references", "pinReferences", "pins"):
+                        if k in params:
+                            pads = params.get(k)
+                            break
+                if pads is not None and not isinstance(pads, list):
+                    # Keep the action; handler will return a helpful error.
+                    pads = [pads]
+                params["pads"] = pads if isinstance(pads, list) else []
+
+                if not str(params.get("net", "") or "").strip():
+                    malformed.append("DEFINE_NET missing net")
+                    logger.error(
+                        "Dropping malformed DEFINE_NET action: desc=%r params=%r",
+                        a.description, a.parameters
+                    )
+                    continue
+
+                a.parameters = params
+                safe_actions.append(a)
+                continue
+
+            if a.action_type == DesignActionType.ASSIGN_NETS:
+                params = dict(a.parameters or {})
+                assigns = params.get("assignments")
+
+                # Common alternate container key.
+                if not isinstance(assigns, list) or not assigns:
+                    assigns = params.get("net_assignments") or params.get("netAssignments")
+
+                normalized: List[Dict[str, Any]] = []
+
+                def _split_pin_ref(text: str) -> Optional[Tuple[str, str]]:
+                    s = str(text or "").strip()
+                    if not s:
+                        return None
+                    m = re.match(r"^\s*([A-Za-z]+\d+)\s*[-/:]\s*([A-Za-z0-9]+)\s*$", s)
+                    if m:
+                        return m.group(1).upper(), m.group(2)
+                    return None
+
+                if isinstance(assigns, list) and assigns:
+                    for it in assigns:
+                        if not isinstance(it, dict):
+                            continue
+                        net = (
+                            it.get("net")
+                            or it.get("net_name")
+                            or it.get("netName")
+                            or it.get("name")
+                        )
+                        net_s = str(net or "").strip()
+                        if not net_s:
+                            continue
+
+                        # Either explicit {ref,pad}, or a "pin_ref"/"pin_references" style.
+                        ref = it.get("ref") or it.get("reference") or it.get("designator")
+                        pad = it.get("pad") or it.get("pin") or it.get("pad_num")
+
+                        if isinstance(ref, str) and isinstance(pad, (str, int, float)) and str(pad).strip():
+                            normalized.append(
+                                {"net": net_s, "ref": str(ref).strip().upper(), "pad": str(pad).strip()}
+                            )
+                            continue
+
+                        pin_ref = it.get("pin_ref") or it.get("pinRef")
+                        if isinstance(pin_ref, str):
+                            sp = _split_pin_ref(pin_ref)
+                            if sp:
+                                normalized.append({"net": net_s, "ref": sp[0], "pad": sp[1]})
+                                continue
+
+                        pin_refs = it.get("pin_references") or it.get("pinReferences") or it.get("pin_refs")
+                        if isinstance(pin_refs, list):
+                            for pr in pin_refs:
+                                sp = _split_pin_ref(str(pr))
+                                if sp:
+                                    normalized.append({"net": net_s, "ref": sp[0], "pad": sp[1]})
+                            continue
+
+                        # Common grouped encoding:
+                        # {"net_name":"GND","pads":["U3/8","U3/22","C1/2", ...]}
+                        pads = it.get("pads") or it.get("pad_refs") or it.get("padRefs")
+                        if isinstance(pads, list):
+                            for p in pads:
+                                if isinstance(p, dict):
+                                    r = p.get("ref") or p.get("reference") or p.get("designator")
+                                    pn = p.get("pad") or p.get("pin") or p.get("pad_num")
+                                    if isinstance(r, str) and str(pn or "").strip():
+                                        normalized.append(
+                                            {"net": net_s, "ref": str(r).strip().upper(), "pad": str(pn).strip()}
+                                        )
+                                    continue
+                                sp = _split_pin_ref(str(p))
+                                if sp:
+                                    normalized.append({"net": net_s, "ref": sp[0], "pad": sp[1]})
+                            continue
+
+                        # Another common shape: {net_name, pin_ref: "U1-1"}.
+                        pin_ref_alt = it.get("pin_ref") or it.get("pin_ref")
+                        if isinstance(pin_ref_alt, str):
+                            sp = _split_pin_ref(pin_ref_alt)
+                            if sp:
+                                normalized.append({"net": net_s, "ref": sp[0], "pad": sp[1]})
+
+                if normalized:
+                    params["assignments"] = normalized
+                    a.parameters = params
+                    safe_actions.append(a)
+                    continue
+
+                malformed.append("ASSIGN_NETS missing assignments")
+                logger.error(
+                    "Dropping malformed ASSIGN_NETS action: desc=%r params=%r",
+                    a.description, a.parameters
+                )
+                continue
+
             if a.action_type not in {DesignActionType.DOWNLOAD_SYMBOL, DesignActionType.DOWNLOAD_FOOTPRINT}:
                 safe_actions.append(a)
                 continue
@@ -743,6 +951,12 @@ When you propose actions, you must follow the exact JSON schema requested by the
 
         # If we dropped download actions and nothing remains, turn it into a clear clarifying question.
         if not safe_actions and actions:
+            if malformed:
+                return (
+                    "I skipped malformed action(s) from the model output. "
+                    "I need concrete parameters (for example ADD_COMPONENT.query "
+                    "or DEFINE_NET.net/pads) before executing."
+                ), []
             # Prefer asking for package (most common missing detail).
             if any(m.startswith('package for ') for m in missing):
                 part = missing[0].replace('package for ', '')
@@ -781,28 +995,22 @@ When you propose actions, you must follow the exact JSON schema requested by the
                             text: str,
                             context: Dict[str, Any]) -> List[DesignAction]:
         """Use LLM for advanced interpretation."""
-        if not self._llm_client:
-            return []
-        
-        try:
-            # Build prompt with context
-            prompt = self._build_interpretation_prompt(text, context)
-            
-            # Call LLM with a design-tool system prompt (NOT the explanation-only prompt)
-            from ..llm.client import LLMMessage
-            response_obj = self._llm_client.chat(
-                [LLMMessage(role='user', content=prompt)],
-                system_prompt=self.DESIGN_SYSTEM_PROMPT,
-            )
-            response = response_obj.content
-            
-            # Parse response into actions
-            actions = self._parse_llm_response(response)
-            return actions
-            
-        except Exception as e:
-            logger.exception(f"LLM interpretation failed: {e}")
-            return []
+        from ..llm.client import LLMError, LLMMessage
+        if not self._llm_client or not getattr(self._llm_client, "is_available", False):
+            raise LLMError("LLM is required for interpretation but is not available/configured.")
+
+        # Build prompt with context
+        prompt = self._build_interpretation_prompt(text, context)
+
+        # Call LLM with a design-tool system prompt (NOT the explanation-only prompt)
+        response_obj = self._llm_client.chat(
+            [LLMMessage(role='user', content=prompt)],
+            system_prompt=self.DESIGN_SYSTEM_PROMPT,
+        )
+        response = response_obj.content
+
+        # Parse response into actions
+        return self._parse_llm_response(response)
     
     def _build_interpretation_prompt(self, text: str, context: Dict[str, Any]) -> str:
         """Build prompt for LLM interpretation."""
@@ -833,6 +1041,14 @@ Return ONLY a JSON array of actions with this shape:
     }}
 ]
 
+Parameter schema rules (use exactly these keys; do not use aliases like "id"):
+- MOVE_COMPONENT.parameters = {{ "ref": "U1", "location": {{ "x": 10.0, "y": 20.0 }} }}  (mm)
+- ROTATE_COMPONENT.parameters = {{ "ref": "U1", "angle": 90 }}  (degrees)
+- ADD_COMPONENT.parameters = {{ "query": "Library:Footprint_Name" }}; optional "location": {{ "x": ..., "y": ... }}
+- DELETE_COMPONENT.parameters = {{ "ref": "U1" }}
+- ALIGN_COMPONENTS.parameters = {{ "refs": ["U1","J1"], "direction": "horizontal" }}
+- DEFINE_BOARD_OUTLINE.parameters = {{ "width_mm": 80.0, "height_mm": 50.0 }}
+
 Rules:
 - If the request is purely informational, return []
 - Prefer the minimal number of actions
@@ -844,19 +1060,30 @@ Rules:
     def _parse_llm_response(self, response: str) -> List[DesignAction]:
         """Parse LLM response into actions."""
         import json
+        from ..llm.client import LLMError
+        if not response:
+            raise LLMError("LLM returned empty response content.")
+        start = response.find('[')
+        end = response.rfind(']') + 1
+        if start < 0 or end <= start:
+            raise LLMError("Invalid LLM response: expected a JSON array.")
         try:
-            start = response.find('[')
-            end = response.rfind(']') + 1
-            if start >= 0 and end > start:
-                data = json.loads(response[start:end])
-                return [a for a in (self._parse_action_item(item) for item in data) if a is not None]
+            data = json.loads(response[start:end])
         except Exception as e:
-            logger.warning("Failed to parse LLM response: %s", e)
-        return []
+            raise LLMError(f"Invalid LLM response: failed to parse JSON array: {e}") from e
+        if not isinstance(data, list):
+            raise LLMError("Invalid LLM response: expected a JSON array.")
+        actions: List[DesignAction] = []
+        for idx, item in enumerate(data):
+            a = self._parse_action_item(item)
+            if a is None:
+                raise LLMError(f"Invalid LLM action item at index {idx}.")
+            actions.append(a)
+        return actions
 
     # ------------------------------------------------------------------
-    # Shared helpers for action JSON parsing (used by _chat_with_llm,
-    # _parse_llm_response, and _extract_actions_from_malformed).
+    # Shared helpers for action JSON parsing (used by _chat_with_llm and
+    # _parse_llm_response).
     # ------------------------------------------------------------------
 
     _APPROVAL_REQUIRED_TYPES = frozenset({
@@ -909,11 +1136,6 @@ Rules:
                 return DesignActionType[cleaned]
             except KeyError:
                 pass
-        squeezed = re.sub(r"[^A-Za-z0-9]", "", raw_name).upper()
-        if squeezed:
-            for t in DesignActionType:
-                if re.sub(r"_", "", t.name).upper() == squeezed:
-                    return t
         return DesignActionType.UNKNOWN
 
     @staticmethod
@@ -940,11 +1162,20 @@ Rules:
                 action_type_val = item.get(k)
                 break
         action_type = cls._normalize_action_type(action_type_val)
+        if action_type == DesignActionType.UNKNOWN:
+            return None
 
-        # Parameters
+        # Parameters (canonical: object; for parameterless actions allow missing/null)
         params = item.get('parameters') or item.get('params') or item.get('arguments')
-        if not isinstance(params, dict):
+        if params is None:
             params = {}
+        if not isinstance(params, dict):
+            # Allow a missing/blank parameters field for actions that take no parameters.
+            if action_type in (DesignActionType.RUN_DRC, DesignActionType.RUN_ERC, DesignActionType.AUTOROUTE_BOARD, DesignActionType.DELETE_TRACKS):
+                params = {}
+            else:
+                return None
+        params = normalize_action_parameters(action_type, params)
 
         # Approval
         requires_val = None
@@ -967,93 +1198,6 @@ Rules:
             preview_text=item.get('preview_text') or item.get('previewText'),
         )
 
-    def _extract_actions_from_malformed(self, raw_text: str) -> Tuple[str, List['DesignAction']]:
-        """Best-effort extraction when the model emits malformed/truncated JSON."""
-        import json
-        assistant_msg = ""
-        actions: List[DesignAction] = []
-
-        # Assistant message (best-effort)
-        m = re.search(
-            r'"(?:assistant_message|assistantMessage|message|assistant|response)"\s*:\s*"(?P<msg>[^"\\]*(?:\\.[^"\\]*)*)"',
-            raw_text,
-        )
-        if m:
-            try:
-                assistant_msg = bytes(m.group('msg'), 'utf-8').decode('unicode_escape').strip()
-            except Exception:
-                assistant_msg = m.group('msg').strip()
-
-        # Scan for JSON objects inside the "actions" array char-by-char.
-        idx = raw_text.find('"actions"')
-        if idx != -1:
-            lb = raw_text.find('[', idx)
-            if lb != -1:
-                i, in_str, esc, depth, obj_start = lb + 1, False, False, 0, None
-                while i < len(raw_text):
-                    ch = raw_text[i]
-                    if in_str:
-                        if esc:
-                            esc = False
-                        elif ch == '\\':
-                            esc = True
-                        elif ch == '"':
-                            in_str = False
-                        i += 1
-                        continue
-                    if ch == '"':
-                        in_str = True
-                        i += 1
-                        continue
-                    if ch == '{':
-                        if depth == 0:
-                            obj_start = i
-                        depth += 1
-                    elif ch == '}':
-                        if depth > 0:
-                            depth -= 1
-                            if depth == 0 and obj_start is not None:
-                                try:
-                                    item_obj = json.loads(raw_text[obj_start:i + 1])
-                                except Exception:
-                                    item_obj = None
-                                if isinstance(item_obj, dict):
-                                    a = self._parse_action_item(item_obj)
-                                    if a is not None:
-                                        actions.append(a)
-                                obj_start = None
-                    elif ch == ']':
-                        break
-                    i += 1
-
-        if actions:
-            return assistant_msg, actions
-
-        # Regex fallback for the most common case.
-        m_action = re.search(
-            r'"(?:action_type|actiontype|actionType)"\s*:\s*"(?P<atype>[A-Za-z0-9_\- ]+)"',
-            raw_text,
-        )
-        if m_action:
-            params: Dict[str, Any] = {}
-            for key, pat in [
-                ('query', r'"query"\s*:\s*"(?P<v>[^"]+)"'),
-                ('part_name', r'"part_name"\s*:\s*"(?P<v>[^"]+)"'),
-                ('package', r'"package"\s*:\s*"(?P<v>[^"]+)"'),
-            ]:
-                m = re.search(pat, raw_text)
-                if m:
-                    params[key] = m.group('v').strip()
-            atype = self._normalize_action_type(m_action.group('atype'))
-            actions.append(DesignAction(
-                action_type=atype,
-                description="",
-                parameters=params,
-                requires_approval=atype != DesignActionType.SEARCH_PART,
-            ))
-
-        return assistant_msg, actions
-
     def _chat_with_llm(self, text: str, context: Dict[str, Any]) -> Tuple[str, List[DesignAction], float]:
         """Use the LLM to produce both an assistant response and tool-like actions.
 
@@ -1064,6 +1208,25 @@ Rules:
             from ..llm.client import LLMError, LLMMessage
         except Exception:  # pragma: no cover
             LLMError = Exception
+
+        def _looks_truncated_json(raw_text: str, err: Optional[Exception] = None) -> bool:
+            s = (raw_text or "").strip()
+            if not s:
+                return False
+            # Heuristics: partial object, missing closing braces/brackets, or common truncation errors.
+            if '"actions"' in s or '"assistant_message"' in s:
+                if s.count("{") > s.count("}"):
+                    return True
+                if s.count("[") > s.count("]"):
+                    return True
+                if not s.endswith("}"):
+                    # Valid JSON can end with whitespace; we already stripped.
+                    return True
+            if err is not None:
+                msg = str(err)
+                if "Unterminated string" in msg or "Expecting value" in msg or "EOF" in msg:
+                    return True
+            return False
 
         try:
             tools = [a.name for a in self.SUPPORTED_LLM_TOOLS]
@@ -1101,65 +1264,40 @@ Rules:
 
 CONTEXT:
 - Active editor: {context.get('active_editor', 'pcb')}
+- Available action_type values: {', '.join(tools)}
+- Board outline already defined: {bool(context.get('outline_defined', False))}
+- Board outline (mm): width={context.get('board_width','?')} height={context.get('board_height','?')} origin=({context.get('board_origin_x','?')},{context.get('board_origin_y','?')}) center=({context.get('board_center_x','?')},{context.get('board_center_y','?')})
 
-AVAILABLE TOOLS (action_type values):
-{', '.join(tools)}
-
-PARAMETER KEYS for common tools:
-- SEARCH_PART: {{ "query": "<part number or description>" }}
-- DOWNLOAD_SYMBOL: {{ "part_name": "<MPN>" }}
-- DOWNLOAD_FOOTPRINT: {{ "part_name": "<MPN>", "package": "<optional package>" }}
-- ADD_COMPONENT: {{ "query": "<footprint name/manufacturer+mpn/description>", "location": "<optional x,y in mm>", "ref_prefix": "<optional ref prefix>" }}
-- EXPORT_BOM: {{ "format": "<jlcpcb|lcsc|mouser|digikey>" }}
-- DRAW_TRACK: {{ "from_point": "<ref/pin>", "to_point": "<ref/pin>", "layer": "<optional: F.Cu, B.Cu, In1.Cu, In2.Cu>" }}
-- ASSIGN_NETS: {{ "assignments": [{{"ref":"U1","pad":"1","net":"GND"}}, {{"ref":"U1","pad":"2","net":"VCC"}}] }}
-- DEFINE_NET: {{ "net": "<net name>", "pads": ["U1/1", "J1/2", {{"ref":"U2","pad":"14"}}] }}
-- MOVE_COMPONENT: {{ "ref": "<designator>", "location": "<x,y>" }}
-- ROTATE_COMPONENT: {{ "ref": "<designator>", "angle": "<degrees>" }}
-- ADD_VIA: {{ "location": "<x,y in mm>", "net": "<net name>", "size_mm": 0.8, "drill_mm": 0.4 }}
-- DEFINE_BOARD_OUTLINE: {{ "width": <mm>, "height": <mm> }}  (ONLY width+height; host auto-centers on page — NEVER mention origin/0,0)
-- ADD_MOUNTING_HOLE: {{ "size": "3.2", "location": "<x,y in mm>" }}
-- ALIGN_COMPONENTS: {{ "refs": "R1 R2 R3", "direction": "horizontally|vertically" }}
-- ADD_TEXT: {{ "text": "<content>", "location": "<x,y>", "layer": "F.SilkS" }}
-- ADD_POLYGON: {{ "layer": "In1.Cu", "net": "GND", "x": 0, "y": 0, "width": <mm>, "height": <mm> }}
-- AUTOROUTE_BOARD: {{ }}
-- SET_LAYER_COUNT: {{ "count": 2 }}
-- DELETE_TRACKS: {{ }}  (deletes ALL tracks and vias on the board — use before re-routing)
-- DELETE_COMPONENT: {{ "ref": "<designator>" }}
-- RUN_DRC: {{ }}
-- RUN_ERC: {{ }}  (run Electrical Rule Check — checks netlist connectivity, missing connections, pin conflicts)
-- SEARCH_WEB: {{ "query": "<component MPN or description>" }}  (search LCSC/Mouser/Octopart for pricing, specs, datasheets)
-- LOOKUP_DATASHEET: {{ "mpn": "<manufacturer part number>" }}  (find and return datasheet URL)
-
-INSTRUCTIONS:
-Respond with valid JSON matching this schema:
+Return JSON only:
 {{
-  "assistant_message": "your conversational response to the user",
+  "assistant_message": "short user-facing reply",
   "actions": [
     {{
       "action_type": "TOOL_NAME",
-      "description": "short summary of what this does",
-      "parameters": {{ "key": "value" }},
+      "description": "short summary",
+      "parameters": {{ }},
       "requires_approval": true,
-      "preview_text": "user-facing preview text"
+      "preview_text": "short preview"
     }}
   ]
 }}
 
 Rules:
-- If the user is confirming a previous proposal, you MUST include the corresponding action(s).
-- Use the full conversation history above; do not re-ask questions the user already answered.
-- If inputs are missing, ask a clarifying question in assistant_message and set actions to [].
-- Treat strings that look like part numbers (e.g., ATmega328P-PU, STM32F103C8T6) as part numbers.
-- Do NOT reinterpret part-number suffixes like "-PU" as "pull-up".
-- If the user wants the component placed in the center (or gives no location), omit "location" — the host will place it at the board center by default.
-- Do NOT propose DOWNLOAD_SYMBOL / DOWNLOAD_FOOTPRINT unless you have successfully located a matching part/asset (otherwise ask a question and return actions: []).
-- You MUST always output valid JSON. No markdown, no extra text outside the JSON object."""
+- If inputs are missing, ask one clarifying question and return actions: [].
+- Reuse conversation history; do not re-ask answered questions.
+- Treat part-like tokens as part numbers; do not reinterpret suffixes.
+- Omit ADD_COMPONENT location when user did not provide one.
+- If board outline is already defined, do not propose DEFINE_BOARD_OUTLINE.
+- DEFINE_BOARD_OUTLINE must only use width/height.
+- Do not propose DOWNLOAD_* actions unless a matching asset is already resolved.
+- Use exactly one key per parameter (no aliases): component reference key is "ref" (never "id"); location is an object {{ "x": ..., "y": ... }} (never a 2-item array).
+- Output valid JSON only."""
 
             messages.append(LLMMessage(role='user', content=user_prompt))
 
             # --- Call LLM and parse response ---------------------------
             did_retry_for_length = False
+            did_retry_for_schema = False
             old_max_tokens: Optional[int] = None
             try:
                 while True:
@@ -1170,15 +1308,7 @@ Rules:
                     raw = (response_obj.content or "").strip()
 
                     if not raw:
-                        verbose = bool((context or {}).get('verbose'))
-                        if verbose:
-                            rr = getattr(response_obj, 'raw_response', None)
-                            rr_keys = list(rr.keys()) if isinstance(rr, dict) else []
-                            return (
-                                f"LLM returned empty content. Raw response keys: {rr_keys}",
-                                [], 0.1,
-                            )
-                        return "LLM returned an empty response. Check your API base/model settings.", [], 0.1
+                        raise LLMError("LLM returned empty content.")
 
                     if logger.isEnabledFor(logging.DEBUG):
                         logger.debug("DesignAgent raw LLM response: %s", raw[:500])
@@ -1187,16 +1317,26 @@ Rules:
                     obj: Any = None
                     try:
                         obj = json.loads(raw)
-                    except Exception:
-                        start = raw.find('{')
-                        end = raw.rfind('}') + 1
-                        if start >= 0 and end > start:
-                            try:
-                                obj = json.loads(raw[start:end])
-                            except Exception:
-                                pass
+                    except Exception as e:
+                        finish_reason = self._get_finish_reason(response_obj)
+                        truncated = _looks_truncated_json(raw, err=e) or (finish_reason == 'length')
+                        if not did_retry_for_length and truncated:
+                            # Ask the model to resend the full JSON object. This is not a
+                            # deterministic fallback; it keeps the LLM in the loop.
+                            old_max_tokens = int(getattr(self._llm_client.config, 'max_tokens', 1024))
+                            self._llm_client.config.max_tokens = min(8192, max(2048, old_max_tokens * 4))
+                            did_retry_for_length = True
+                            messages.append(LLMMessage(
+                                role="user",
+                                content=(
+                                    "Your previous response was truncated/invalid JSON. "
+                                    "Resend the COMPLETE JSON object only (no markdown, no commentary)."
+                                ),
+                            ))
+                            continue
+                        raise LLMError(f"Invalid LLM response: expected JSON object: {e}") from e
 
-                    # If we couldn't get a dict, try retry-for-length or salvage.
+                    # If we couldn't get a dict, retry once for truncation.
                     if not isinstance(obj, dict):
                         has_partial = '"actions"' in raw or '"assistant_message"' in raw
                         finish_reason = self._get_finish_reason(response_obj)
@@ -1211,23 +1351,51 @@ Rules:
                             did_retry_for_length = True
                             continue
 
-                        salvage_msg, salvage_actions = self._extract_actions_from_malformed(raw)
-                        if salvage_actions:
-                            return salvage_msg or raw, salvage_actions, 0.7
-                        return raw, [], 0.3
+                        raise LLMError("Invalid LLM response: expected a JSON object.")
 
                     # --- Successful JSON parse ---
-                    assistant_message = ""
+                    assistant_message: Optional[str] = None
                     for key in ("assistant_message", "assistantMessage", "message", "assistant", "response"):
                         if key in obj and obj.get(key) not in (None, ""):
                             assistant_message = str(obj.get(key)).strip()
                             break
+                    if assistant_message is None:
+                        raise LLMError("Invalid LLM response: missing 'assistant_message'.")
 
-                    actions_json = obj.get('actions') or obj.get('tool_actions') or obj.get('toolActions') or []
+                    actions_key = None
+                    for k in ('actions', 'tool_actions', 'toolActions'):
+                        if k in obj:
+                            actions_key = k
+                            break
+                    if actions_key is None:
+                        raise LLMError("Invalid LLM response: missing 'actions' array.")
+                    actions_json = obj.get(actions_key) or []
                     if not isinstance(actions_json, list):
-                        actions_json = []
+                        raise LLMError("Invalid LLM response: 'actions' must be a JSON array.")
 
-                    actions = [a for a in (self._parse_action_item(item) for item in actions_json) if a is not None]
+                    actions: List[DesignAction] = []
+                    for idx, item in enumerate(actions_json):
+                        a = self._parse_action_item(item)
+                        if a is None:
+                            if not did_retry_for_schema:
+                                did_retry_for_schema = True
+                                logger.error(
+                                    "Invalid LLM action item at index %d. item=%r raw_head=%r",
+                                    idx,
+                                    item,
+                                    raw[:500],
+                                )
+                                messages.append(LLMMessage(
+                                    role="user",
+                                    content=(
+                                        f"Your previous JSON had an invalid action item at index {idx}. "
+                                        "Resend the COMPLETE JSON object only. "
+                                        "Every action must be an object with keys: action_type, description, parameters (object), requires_approval."
+                                    ),
+                                ))
+                                continue
+                            raise LLMError(f"Invalid LLM action item at index {idx}.")
+                        actions.append(a)
                     confidence = 0.9 if actions else 0.5
                     return assistant_message, actions, confidence
             finally:
@@ -1237,41 +1405,11 @@ Rules:
                     except Exception:
                         pass
 
-        except LLMError as e:
-            # Provider/network/auth errors should be shown even when not verbose,
-            # otherwise users get stuck in a generic loop.
-            logger.warning("LLM request failed: %s", e)
-            verbose = bool((context or {}).get('verbose'))
-            msg = str(e).strip()
-            lower_msg = msg.lower()
-            if len(msg) > 600:
-                msg = msg[:600] + "…"
-            extra_tip = "Tip: enable Verbose for more diagnostics."
-            if "finish_reason" in msg and "length" in msg:
-                extra_tip = (
-                    "Tip: this looks like the completion was cut off by a token limit. "
-                    "Increase `Max tokens` in ⚙ Settings (try 1024-2048) and retry."
-                )
-            elif "http 401" in lower_msg:
-                extra_tip = (
-                    "Tip: 401 usually means your API key does not match the API base/provider. "
-                    "For OpenAI use an OpenAI key with `https://api.openai.com/v1`. "
-                    "For GitHub Models use `GITHUB_TOKEN` (or API key field) with "
-                    "`https://models.github.ai/inference` and model `openai/gpt-5`."
-                )
-            if verbose:
-                return f"LLM error: {msg}", [], 0.1
-            return (
-                f"LLM request failed: {msg} \n\n{extra_tip}",
-                [],
-                0.1,
-            )
+        except LLMError:
+            raise
         except Exception as e:
-            logger.exception(f"LLM chat failed: {e}")
-            verbose = bool((context or {}).get('verbose'))
-            if verbose:
-                return f"LLM error: {e}", [], 0.1
-            return "I hit an error while contacting the LLM. Tip: enable Verbose for details.", [], 0.1
+            logger.exception("LLM chat failed: %s", e)
+            raise LLMError(f"LLM chat failed: {e}") from e
     
     def _generate_description(self, 
                               action_type: DesignActionType,
@@ -1520,9 +1658,23 @@ Rules:
                 success, message = await handler(action, context)
                 action.success = success
                 action.result_message = message
+                if not success:
+                    logger.warning(
+                        "Action failed: type=%s desc=%r params=%r message=%r",
+                        action.action_type.name,
+                        action.description,
+                        action.parameters,
+                        action.result_message,
+                    )
             else:
                 action.success = False
                 action.result_message = f"No handler for action type: {action.action_type.name}"
+                logger.error(
+                    "Missing action handler: type=%s desc=%r params=%r",
+                    action.action_type.name,
+                    action.description,
+                    action.parameters,
+                )
             
             action.executed = True
             
@@ -1667,9 +1819,20 @@ Rules:
         for item in assignments:
             if not isinstance(item, dict):
                 continue
-            ref = str(item.get('ref', '') or '').strip().upper()
-            pad_num = str(item.get('pad', '') or '').strip()
-            net_name = str(item.get('net', '') or '').strip()
+            ref_val = item.get('ref') or item.get('reference') or item.get('designator')
+            ref = str(ref_val or '').strip().upper()
+            pad_val = item.get('pad') or item.get('pin') or item.get('pad_num')
+            pad_num = str(pad_val or '').strip()
+            net_val = item.get('net') or item.get('net_name') or item.get('netName') or item.get('name')
+            net_name = str(net_val or '').strip()
+
+            # Accept "pin_ref" like "U1-3" / "U1:3" / "U1/3".
+            if (not ref or not pad_num) and isinstance(item.get('pin_ref'), str):
+                pr = str(item.get('pin_ref') or '').strip()
+                m = re.match(r"^\s*([A-Za-z]+\d+)\s*[-/:]\s*([A-Za-z0-9]+)\s*$", pr)
+                if m:
+                    ref = m.group(1).upper()
+                    pad_num = m.group(2).strip()
             if not ref or not pad_num or not net_name:
                 continue
 
@@ -1760,8 +1923,10 @@ Rules:
         pads = params.get('pads')
         if not net_name:
             return False, "Missing 'net' (e.g., {net:'GND', pads:[...]})"
-        if not isinstance(pads, list) or not pads:
-            return False, "Missing 'pads' list (e.g., {net:'GND', pads:['U1/1','J1/2']})"
+        if pads is None:
+            pads = []
+        if not isinstance(pads, list):
+            pads = [pads]
 
         board = context.get('board')
         if board is None:
@@ -1845,6 +2010,11 @@ Rules:
         if net_obj is None:
             return False, f"{net_name}: net create/find failed"
 
+        # If no pads were provided, defining the net means "ensure this net exists".
+        # (Some LLMs emit DEFINE_NET to create nets before ASSIGN_NETS.)
+        if not pads:
+            return True, f"Created/ensured net '{net_name}'."
+
         assigned = 0
         errors: List[str] = []
         invalid: List[str] = []
@@ -1854,10 +2024,12 @@ Rules:
             pad_num = ''
             if isinstance(item, str):
                 text = item.strip()
-                if '/' not in text:
+                # Accept U1/1, U1-1, U1:1.
+                m = re.match(r"^\s*([A-Za-z]+\d+)\s*[-/:]\s*([A-Za-z0-9]+)\s*$", text)
+                if not m:
                     invalid.append(text)
                     continue
-                ref, pad_num = text.split('/', 1)
+                ref, pad_num = m.group(1), m.group(2)
             elif isinstance(item, dict):
                 ref = str(item.get('ref', '') or '')
                 pad_num = str(item.get('pad', '') or '')
@@ -2015,6 +2187,38 @@ Rules:
         if not query:
             return False, "No component/footprint query provided"
 
+        def build_query_variants(raw_query: str) -> List[str]:
+            variants: List[str] = []
+
+            def add_variant(value: str) -> None:
+                candidate = str(value or '').strip()
+                if not candidate:
+                    return
+                if candidate not in variants:
+                    variants.append(candidate)
+
+            add_variant(raw_query)
+            add_variant(raw_query.replace(":", " "))
+            add_variant(re.sub(r'[_\-/]+', ' ', raw_query))
+            if ":" in raw_query:
+                lib_part = raw_query.split(":", 1)[1].strip()
+                add_variant(lib_part)
+                add_variant(re.sub(r'[_\-/]+', ' ', lib_part))
+            return variants
+
+        # Guardrail: a package family without a pin count is too ambiguous and
+        # tends to resolve to random small footprints (e.g. DIP-4), which then
+        # cascades into net-assignment/DRC failures. Force explicit pin count.
+        _pkg_families = {
+            "DIP", "PDIP", "QFN", "DFN", "TQFP", "LQFP", "QFP",
+            "SOIC", "SOT", "SSOP", "TSSOP", "HTSSOP", "MSOP", "SOP", "SO",
+        }
+        if query.upper() in _pkg_families and not re.search(r"\d", query):
+            return False, (
+                f"Footprint query '{query}' is too generic. "
+                "Specify the pin count/package (e.g. 'DIP-28', 'TQFP-32')."
+            )
+
         # ── resolve board ────────────────────────────────────────────────────
         board = context.get('board')
         if board is None:
@@ -2043,9 +2247,23 @@ Rules:
             pkg_val = params.get('package')
             if isinstance(pkg_val, str) and pkg_val.strip():
                 package_hint = pkg_val.strip()
+                if package_hint.upper() in _pkg_families and not re.search(r"\d", package_hint):
+                    return False, (
+                        f"Package hint '{package_hint}' is too generic. "
+                        "Specify the pin count/package (e.g. 'DIP-28', 'TQFP-32')."
+                    )
 
             # Try resolve_best_footprint_item (fastest)
-            for attempt_query in [query, package_hint, f"{query} {package_hint}"]:
+            attempt_queries = build_query_variants(query)
+            if package_hint:
+                attempt_queries.extend(build_query_variants(package_hint))
+                attempt_queries.extend(build_query_variants(f"{query} {package_hint}"))
+            dedup_attempts: List[str] = []
+            for q in attempt_queries:
+                if q not in dedup_attempts:
+                    dedup_attempts.append(q)
+
+            for attempt_query in dedup_attempts:
                 if not attempt_query:
                     continue
                 try:
@@ -2061,7 +2279,7 @@ Rules:
 
             # Try resolve_best_footprint_path
             if not fp_path:
-                for attempt_query in [query, package_hint]:
+                for attempt_query in dedup_attempts:
                     if not attempt_query:
                         continue
                     try:
@@ -2076,7 +2294,7 @@ Rules:
 
             # Full search fallback
             if not fp_path:
-                search_queries = [q for q in [query, package_hint, f"{query} {package_hint}"] if q]
+                search_queries = dedup_attempts
                 for sq in search_queries:
                     try:
                         if hasattr(self._library_manager, 'search_parts'):
@@ -2109,6 +2327,63 @@ Rules:
                         continue
 
         if not fp_path:
+            # Provide actionable suggestions so the LLM can choose an actually-available footprint
+            # in the next iteration (without silently picking a deterministic fallback here).
+            suggestions: List[str] = []
+            try:
+                lm = self._library_manager
+                if lm is not None:
+                    alt_queries: List[str] = []
+                    alt_queries.extend(build_query_variants(query)[:4])
+                    ql = query.lower()
+                    if "crystal" in ql or ql.startswith("xtal") or ql.startswith("osc"):
+                        alt_queries.extend(["Crystal", "Crystal SMD", "Oscillator"])
+                    if "arduino" in ql or "shield" in ql:
+                        alt_queries.extend(["PinHeader 2.54", "PinSocket 2.54", "Header 2.54"])
+
+                    seen_alt: set = set()
+                    dedup_alt: List[str] = []
+                    for aq in alt_queries:
+                        aq = str(aq or "").strip()
+                        if not aq:
+                            continue
+                        if aq in seen_alt:
+                            continue
+                        seen_alt.add(aq)
+                        dedup_alt.append(aq)
+
+                    async def _search_one(q: str) -> List[Any]:
+                        try:
+                            if hasattr(lm, "search_parts"):
+                                return await lm.search_parts(q)  # type: ignore[attr-defined]
+                            if hasattr(lm, "search_parts_sync"):
+                                return lm.search_parts_sync(q)  # type: ignore[attr-defined]
+                        except Exception:
+                            return []
+                        return []
+
+                    for aq in dedup_alt[:6]:
+                        results = await _search_one(aq)
+                        for item in (results or [])[:25]:
+                            try:
+                                if not getattr(item, "local_footprint_path", None):
+                                    continue
+                                name = str(getattr(item, "name", "") or "").strip()
+                                if name and name not in suggestions:
+                                    suggestions.append(name)
+                            except Exception:
+                                continue
+                        if len(suggestions) >= 8:
+                            break
+            except Exception:
+                suggestions = []
+
+            if suggestions:
+                shown = ", ".join(suggestions[:6])
+                return False, (
+                    f"No footprint found for '{query}'. "
+                    f"Try one of these local footprint names: {shown}."
+                )
             return False, f"No footprint found for '{query}'. Try a more specific part name."
 
         # ── validate footprint file ──────────────────────────────────────────
@@ -2606,10 +2881,32 @@ Rules:
             else:
                 return False, "Library manager does not support search"
             if results:
-                max_show = min(len(results), 20)
-                lines = [f"Found {len(results)} matching parts:"]
+                verbose = bool((context or {}).get('verbose'))
+
+                def _is_footprint_candidate(item: Any) -> bool:
+                    try:
+                        if getattr(item, 'local_footprint_path', None):
+                            return True
+                        if getattr(item, 'footprint_url', None):
+                            return True
+                        category = str(getattr(item, 'category', '') or '').lower()
+                        if 'footprint' in category:
+                            return True
+                    except Exception:
+                        pass
+                    return False
+
+                ranked = sorted(
+                    list(results),
+                    key=lambda item: (
+                        0 if _is_footprint_candidate(item) else 1,
+                        0 if query.lower() in str(getattr(item, 'name', '') or '').lower() else 1,
+                    ),
+                )
+                max_show = min(len(ranked), 20 if verbose else 6)
+                lines = [f"Found {len(results)} matching parts for '{query}':"]
                 serialized_results = []
-                for item in results[:max_show]:
+                for item in ranked[:max_show]:
                     label = (getattr(item, 'name', '') or getattr(item, 'mpn', '')).strip()
                     pkg = (getattr(item, 'package', '') or '').strip()
                     src = ''
@@ -2617,19 +2914,62 @@ Rules:
                         src = getattr(getattr(item, 'source', None), 'value', '')
                     except Exception:
                         src = ''
+                    is_footprint = _is_footprint_candidate(item)
                     suffix = ""
                     if pkg:
                         suffix += f" ({pkg})"
                     if src:
                         suffix += f" [{src}]"
+                    if not verbose:
+                        suffix += " [fp]" if is_footprint else " [sym]"
                     lines.append(f"- {label}{suffix}")
                     serialized_results.append({
                         "name": label,
                         "package": pkg,
                         "source": src,
+                        "is_footprint_candidate": bool(is_footprint),
                     })
+
+                # Provide a machine-pickable list of footprint identifiers so the LLM can
+                # choose (or refine search) without guessing library names from memory.
+                footprint_candidates: List[str] = []
+                for r in serialized_results:
+                    try:
+                        if not r.get("is_footprint_candidate"):
+                            continue
+                        name = str(r.get("name", "") or "").strip()
+                        if not name:
+                            continue
+                        # Prefer explicit "Lib:Footprint" identifiers; allow others if present.
+                        if ":" in name:
+                            footprint_candidates.append(name)
+                        elif name not in footprint_candidates:
+                            footprint_candidates.append(name)
+                    except Exception:
+                        continue
+
+                if footprint_candidates:
+                    show_n = 12 if verbose else 6
+                    lines.append("")
+                    lines.append("Footprint candidates (use EXACTLY one for ADD_COMPONENT.parameters.query):")
+                    for fp in footprint_candidates[:show_n]:
+                        lines.append(f"- {fp}")
+                    try:
+                        lines.append(f"FOOTPRINT_CANDIDATES_JSON: {json.dumps(footprint_candidates[:12])}")
+                    except Exception:
+                        pass
+                else:
+                    lines.append("")
+                    lines.append(
+                        "No obvious footprint candidates were found. "
+                        "Refine SEARCH_PART with an explicit package/pin count/pitch (e.g. 'TQFP-32 7x7 0.8mm')."
+                    )
                 if len(results) > max_show:
                     lines.append(f"…and {len(results) - max_show} more")
+                logger.info(
+                    "SEARCH_PART query=%r results=%d shown=%d",
+                    query, len(results), max_show
+                )
                 # Persist structured search output for downstream phases.
                 store = context.setdefault("search_part_results", {})
                 if isinstance(store, dict):
@@ -3103,8 +3443,189 @@ Rules:
         This must be executed on KiCad's GUI thread (pcbnew is not thread-safe).
         """
         params = action.parameters or {}
-        ref = str(params.get('ref', '') or '').strip().upper()
+        # Accept a few common key variants; other code paths use "reference".
+        ref_val = (
+            params.get('ref')
+            or params.get('reference')
+            or params.get('designator')
+            or params.get('component')
+        )
+        ref = str(ref_val or '').strip().upper()
+
         location = params.get('location')
+        if location in (None, ""):
+            # Common alternate encodings: x/y pairs or "pos"/"at".
+            if "x" in params and "y" in params:
+                location = {"x": params.get("x"), "y": params.get("y")}
+            elif "x_mm" in params and "y_mm" in params:
+                location = {"x": params.get("x_mm"), "y": params.get("y_mm")}
+            elif "pos" in params:
+                location = params.get("pos")
+            elif "at" in params:
+                location = params.get("at")
+
+        if location in (None, ""):
+            # Last-resort: try to extract coordinates from the action description.
+            try:
+                m = re.search(r"(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)", action.description or "")
+                if m:
+                    location = f"{m.group(1)},{m.group(2)}"
+            except Exception:
+                pass
+
+        strategy = str(params.get("strategy", "") or "").strip().lower()
+        if (location in (None, "")) and strategy:
+            # Strategy-based movement: used by VerificationAgent when it can't
+            # safely invent coordinates. We compute a reasonable target.
+            #
+            # Supported strategies:
+            # - edge_inset: clamp inside the board outline with a small margin
+            # - resolve_overlap / increase_spacing: nudge away from overlapping footprints
+            try:
+                import pcbnew  # type: ignore
+            except Exception:
+                return False, "pcbnew not available (this action must run inside KiCad)"
+
+            board = context.get('board')
+            if board is None:
+                try:
+                    board = pcbnew.GetBoard()
+                except Exception:
+                    board = None
+            if board is None:
+                return False, "No active board found"
+
+            def mm2iu(mm_val: float) -> int:
+                try:
+                    return int(pcbnew.FromMM(float(mm_val)))
+                except Exception:
+                    return int(float(mm_val) * 1e6)
+
+            def iu2mm(iu_val: int) -> float:
+                try:
+                    to_mm = getattr(pcbnew, "ToMM", None)
+                    if callable(to_mm):
+                        return float(to_mm(iu_val))
+                except Exception:
+                    pass
+                return float(iu_val) / 1e6
+
+            def _get_rect(fp_obj):
+                """Return (l,t,r,b,cx,cy,hw,hh) in IU for a footprint."""
+                bb = None
+                for bbm in ("GetCourtyardBoundingBox", "GetBoundingBox"):
+                    fn = getattr(fp_obj, bbm, None)
+                    if callable(fn):
+                        try:
+                            bb = fn() if bbm == "GetCourtyardBoundingBox" else fn(False, False)
+                            if bb and bb.GetWidth() > 0:
+                                break
+                            bb = None
+                        except Exception:
+                            bb = None
+                if bb is None:
+                    # Fallback: 10mm square around position.
+                    try:
+                        pos = fp_obj.GetPosition()
+                        x = int(getattr(pos, "x", pos.GetX()))
+                        y = int(getattr(pos, "y", pos.GetY()))
+                    except Exception:
+                        x, y = 0, 0
+                    half = mm2iu(5.0)
+                    l, t, r, b = x - half, y - half, x + half, y + half
+                    return (l, t, r, b, x, y, half, half)
+
+                l = int(bb.GetLeft())
+                t = int(bb.GetTop())
+                r = int(bb.GetRight())
+                b = int(bb.GetBottom())
+                cx = int(bb.GetX()) + int(bb.GetWidth()) // 2
+                cy = int(bb.GetY()) + int(bb.GetHeight()) // 2
+                hw = int(bb.GetWidth()) // 2
+                hh = int(bb.GetHeight()) // 2
+                return (l, t, r, b, cx, cy, hw, hh)
+
+            def _clamp_to_outline(x_iu: int, y_iu: int, hw: int, hh: int) -> Tuple[int, int]:
+                try:
+                    bb = board.GetBoardEdgesBoundingBox()
+                    bw = int(bb.GetWidth())
+                    bh = int(bb.GetHeight())
+                    if bw <= mm2iu(5) or bh <= mm2iu(5):
+                        return x_iu, y_iu
+                    margin = mm2iu(1.0)
+                    bx_min = int(bb.GetX()) + margin + hw
+                    bx_max = int(bb.GetX()) + bw - margin - hw
+                    by_min = int(bb.GetY()) + margin + hh
+                    by_max = int(bb.GetY()) + bh - margin - hh
+                    if bx_max <= bx_min or by_max <= by_min:
+                        return x_iu, y_iu
+                    x_iu = max(bx_min, min(bx_max, x_iu))
+                    y_iu = max(by_min, min(by_max, y_iu))
+                except Exception:
+                    pass
+                return x_iu, y_iu
+
+            # Find the footprint now (we'll set location below).
+            footprint = None
+            try:
+                for fp in board.GetFootprints():
+                    try:
+                        if str(fp.GetReference()).upper() == ref:
+                            footprint = fp
+                            break
+                    except Exception:
+                        continue
+            except Exception:
+                footprint = None
+
+            if footprint is None:
+                return False, f"Could not find footprint {ref} on the board"
+
+            l, t, r, b, cx, cy, hw, hh = _get_rect(footprint)
+
+            # Compute a new target.
+            new_x = cx
+            new_y = cy
+            if strategy in {"edge_inset"}:
+                new_x, new_y = _clamp_to_outline(new_x, new_y, hw, hh)
+            elif strategy in {"resolve_overlap", "increase_spacing"}:
+                clearance = mm2iu(0.5)
+                push_x = 0.0
+                push_y = 0.0
+                for other in list(board.GetFootprints() or []):
+                    try:
+                        if other is footprint:
+                            continue
+                        ol, ot, or_, ob, ocx, ocy, ohw, ohh = _get_rect(other)
+                    except Exception:
+                        continue
+
+                    # AABB overlap with clearance.
+                    if (r + clearance <= ol) or (l - clearance >= or_) or (b + clearance <= ot) or (t - clearance >= ob):
+                        continue
+
+                    dx = float(cx - ocx)
+                    dy = float(cy - ocy)
+                    if dx == 0.0 and dy == 0.0:
+                        dx = 1.0
+                    mag = (dx * dx + dy * dy) ** 0.5
+                    if mag > 0:
+                        push_x += dx / mag
+                        push_y += dy / mag
+
+                # If we detected overlaps, nudge by 5mm away from the crowd.
+                step = mm2iu(5.0)
+                mag = (push_x * push_x + push_y * push_y) ** 0.5
+                if mag > 0.0:
+                    new_x = int(cx + (push_x / mag) * step)
+                    new_y = int(cy + (push_y / mag) * step)
+
+                new_x, new_y = _clamp_to_outline(new_x, new_y, hw, hh)
+            else:
+                return False, f"Unknown MOVE_COMPONENT strategy: {strategy}"
+
+            location = {"x": round(iu2mm(new_x), 2), "y": round(iu2mm(new_y), 2)}
+
         if not ref or location in (None, ""):
             return False, "Missing component reference or location"
 
@@ -3298,7 +3819,13 @@ Rules:
         This must be executed on KiCad's GUI thread (pcbnew is not thread-safe).
         """
         params = action.parameters or {}
-        ref = str(params.get('ref', '') or '').strip().upper()
+        ref_val = (
+            params.get('ref')
+            or params.get('reference')
+            or params.get('designator')
+            or params.get('component')
+        )
+        ref = str(ref_val or '').strip().upper()
         angle = params.get('angle', '90')
         if not ref:
             return False, "Missing component reference"
@@ -3357,9 +3884,7 @@ Rules:
         """Run KiCad Design Rule Check and return structured results.
 
         Strategy:
-          1. Try kicad-cli pcb drc (KiCad 8+) for JSON output
-          2. Fallback: pcbnew.WriteDRCReport()
-          3. Fallback: parse board markers after manual DRC
+          1. Use kicad-cli pcb drc (KiCad 7/8/9+) for JSON output
         """
         import subprocess
         import tempfile
@@ -3505,69 +4030,11 @@ Rules:
         except Exception as e:
             logger.debug(f"kicad-cli DRC failed: {e}")
 
-        # Strategy 2: pcbnew.WriteDRCReport
-        try:
-            import pcbnew as _pcbnew
-            write_drc = getattr(_pcbnew, 'WriteDRCReport', None)
-            if callable(write_drc):
-                fd, report_path = tempfile.mkstemp(suffix='.txt')
-                import os
-                os.close(fd)
-
-                board = _pcbnew.GetBoard()
-                rules_path = ''
-                try:
-                    rules_path = str(Path(board_path).with_suffix('.kicad_dru'))
-                    if not os.path.exists(rules_path):
-                        rules_path = ''
-                except Exception:
-                    rules_path = ''
-
-                write_drc(board, rules_path, report_path)
-
-                if os.path.exists(report_path):
-                    with open(report_path, 'r') as f:
-                        report_text = f.read()
-                    errors, warnings = self._parse_drc_text_report(report_text)
-                    try:
-                        os.unlink(report_path)
-                    except Exception:
-                        pass
-                    drc_ran = True
-                    return (len(errors) == 0), self._format_drc_results(errors, warnings)
-
-        except Exception as e:
-            logger.debug(f"WriteDRCReport failed: {e}")
-
-        # Strategy 3: Read board markers
-        try:
-            import pcbnew as _pcbnew
-            board = _pcbnew.GetBoard()
-            if board:
-                markers = []
-                try:
-                    for m in board.Markers():
-                        rc = m.GetRCItem()
-                        if rc:
-                            desc = str(rc.GetErrorMessage()) if hasattr(rc, 'GetErrorMessage') else str(rc)
-                            markers.append(desc)
-                except Exception:
-                    pass
-
-                if markers:
-                    for m in markers:
-                        if 'warning' in m.lower():
-                            warnings.append(m)
-                        else:
-                            errors.append(m)
-                    drc_ran = True
-                    return (len(errors) == 0), self._format_drc_results(errors, warnings)
-
-        except Exception as e:
-            logger.debug(f"Board markers read failed: {e}")
-
         if not drc_ran:
-            return False, "DRC could not be run (no kicad-cli output, no WriteDRCReport, and no board markers)."
+            return False, (
+                "DRC could not be run (kicad-cli failed or produced no JSON report). "
+                "This check currently requires kicad-cli."
+            )
 
         return (len(errors) == 0), self._format_drc_results(errors, warnings)
 
@@ -3617,170 +4084,27 @@ Rules:
         return errors, warnings
 
     async def _handle_run_erc(self, action: DesignAction, context: Dict) -> Tuple[bool, str]:
-        """Run a meaningful electrical verification step.
+        """Run PCB-native electrical sanity checks.
 
-        If a schematic exists, run KiCad schematic ERC via `kicad-cli sch erc`.
-        If no schematic exists (PCB-only sessions), run a PCB-native connectivity
-        sanity check: report pads that have no net assigned.
-
-        Note: schematic ERC can pass even when PCB DRC fails (shorts/clearance are
-        physical layout problems, not schematic ERC violations).
+        VibeCAD currently avoids schematic searching/analysis. This check flags
+        pads with no net assigned (netcode 0), which is actionable for PCB-only
+        sessions and avoids schematic vs PCB drift.
         """
-        import subprocess
-        import tempfile
-        import json as _json
-        import os
-
-        # ERC needs a schematic file.  Try to find one from the project.
-        sch_path = context.get('schematic_path', '')
-        if not sch_path:
-            try:
-                import pcbnew as _pcbnew
-                board = _pcbnew.GetBoard()
-                if board:
-                    pcb_fn = board.GetFileName() or ''
-                    if pcb_fn:
-                        from pathlib import Path as _P
-                        sch_candidate = _P(pcb_fn).with_suffix('.kicad_sch')
-                        if sch_candidate.exists():
-                            sch_path = str(sch_candidate)
-            except Exception:
-                pass
-
-        if not sch_path:
-            # PCB-only fallback: surface a real electrical signal instead of a hard fail.
-            try:
-                import pcbnew as _pcbnew  # type: ignore
-                board = context.get('board')
-                if board is None:
-                    board = _pcbnew.GetBoard()
-                if board is None:
-                    return False, "No active board found (cannot run electrical checks)"
-                return self._run_pcb_electrical_check(board, _pcbnew)
-            except Exception as e:
-                return False, (
-                    "No schematic file found for ERC (.kicad_sch). "
-                    "Also failed to run PCB electrical check. "
-                    f"Details: {e}"
-                )
-
-        errors: List[str] = []
-        warnings: List[str] = []
-
-        # Locate kicad-cli
-        cli_cmd = 'kicad-cli'
-        import platform
-        if platform.system() == 'Darwin':
-            candidates = [
-                '/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli',
-                '/Applications/KiCad/kicad.app/Contents/MacOS/kicad-cli',
-                'kicad-cli',
-            ]
-            for c in candidates:
-                if os.path.exists(c) and os.access(c, os.X_OK):
-                    cli_cmd = c
-                    break
-
         try:
-            fd_rep, report_path = tempfile.mkstemp(suffix='.json')
-            os.close(fd_rep)
+            import pcbnew as _pcbnew  # type: ignore
+        except Exception:
+            return False, "pcbnew not available (this action must run inside KiCad)"
 
-            result = subprocess.run(
-                [
-                    cli_cmd, 'sch', 'erc',
-                    '--output', report_path,
-                    '--format', 'json',
-                    '--severity-all',
-                    '--exit-code-violations',
-                    sch_path,
-                ],
-                capture_output=True, text=True, timeout=60,
-            )
-
-            if os.path.exists(report_path) and os.path.getsize(report_path) > 0:
-                try:
-                    with open(report_path, 'r') as f:
-                        erc_data = _json.load(f)
-                except _json.JSONDecodeError:
-                    erc_data = {}
-
-                sheets = erc_data.get('sheets', [])
-                for sheet in sheets:
-                    violations = sheet.get('violations', [])
-                    if isinstance(violations, dict):
-                        violations = violations.get('items', [])
-                    for v in (violations or []):
-                        sev = v.get('severity', 'error')
-                        desc = v.get('description', 'Unknown ERC violation')
-                        items = v.get('items', [])
-                        pos_str = ''
-                        for item in items:
-                            pos = item.get('pos', {})
-                            if pos:
-                                pos_str = f" at ({pos.get('x', 0):.2f}, {pos.get('y', 0):.2f})"
-                                break
-                        entry = f"{desc}{pos_str}"
-                        if sev == 'warning':
-                            warnings.append(entry)
-                        else:
-                            errors.append(entry)
-
-                try:
-                    os.unlink(report_path)
-                except Exception:
-                    pass
-
-                sch_result_text = self._format_erc_results(errors, warnings)
-                sch_ok = len(errors) == 0
-
-                # ALWAYS also run PCB connectivity check and append it
-                pcb_suffix = ""
-                try:
-                    import pcbnew as _pcbnew2
-                    _board2 = context.get('board')
-                    if _board2 is None:
-                        _board2 = _pcbnew2.GetBoard()
-                    if _board2 is not None:
-                        pcb_ok, pcb_text = self._run_pcb_electrical_check(_board2, _pcbnew2)
-                        pcb_suffix = "\n\n--- PCB Connectivity Check ---\n" + pcb_text
-                        if not pcb_ok:
-                            sch_ok = False
-                except Exception:
-                    pass
-
-                return sch_ok, sch_result_text + pcb_suffix
-
+        board = context.get('board')
+        if board is None:
             try:
-                os.unlink(report_path)
+                board = _pcbnew.GetBoard()
             except Exception:
-                pass
+                board = None
+        if board is None:
+            return False, "No active board found (cannot run electrical checks)"
 
-            # If no report was produced, be explicit: avoid the appearance of a fake always-0 check.
-            if result.returncode == 0:
-                extra = result.stderr.strip()
-                if extra:
-                    extra = "\n(kicad-cli stderr: " + extra + ")"
-                return True, (
-                    "ERC_STATUS: PASS\n"
-                    "ERC found no violations, but KiCad emitted no JSON report output. "
-                    "(This can happen on clean designs.)" + extra
-                )
-
-            return False, (
-                "ERC_STATUS: FAIL\n"
-                "ERC failed to produce a JSON report. "
-                f"kicad-cli exit={result.returncode}. "
-                f"stderr: {result.stderr.strip()}"
-            )
-
-        except FileNotFoundError:
-            return False, ("kicad-cli not found. ERC requires KiCad 7+ with kicad-cli. "
-                           "On macOS, check /Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli")
-        except subprocess.TimeoutExpired:
-            return False, "ERC timed out after 60 seconds."
-        except Exception as e:
-            logger.exception("ERC failed")
-            return False, f"ERC failed: {e}"
+        return self._run_pcb_electrical_check(board, _pcbnew)
 
     def _format_erc_results(self, errors: List[str], warnings: List[str]) -> str:
         """Format ERC results into a human-readable summary."""
@@ -4045,8 +4369,32 @@ Rules:
             return False, "pcbnew not available"
 
         params = action.parameters or {}
-        width = float(params.get('width', 0) or 0) or 100.0
-        height = float(params.get('height', 0) or 0) or 80.0
+        def parse_mm(value: Any, default: float) -> float:
+            if value is None:
+                return default
+            if isinstance(value, (int, float)):
+                parsed = float(value)
+                return parsed if parsed > 0 else default
+            if isinstance(value, str):
+                text = value.strip().lower()
+                if not text:
+                    return default
+                try:
+                    parsed = float(text)
+                    return parsed if parsed > 0 else default
+                except Exception:
+                    pass
+                match = re.match(r"^\s*(-?\d+(?:\.\d+)?)\s*(mm|mil)?\s*$", text)
+                if match:
+                    parsed = float(match.group(1))
+                    unit = match.group(2) or "mm"
+                    if unit == "mil":
+                        parsed *= 0.0254
+                    return parsed if parsed > 0 else default
+            return default
+
+        width = parse_mm(params.get('width'), 100.0)
+        height = parse_mm(params.get('height'), 80.0)
 
         board = context.get('board')
         if board is None:
@@ -4238,13 +4586,16 @@ Rules:
             return False, "pcbnew not available"
 
         params = action.parameters or {}
-        refs_str = str(params.get('refs', '') or '').strip()
+        refs_val = params.get('refs')
         direction = str(params.get('direction', 'horizontally') or '').strip().lower()
 
-        if not refs_str:
+        if not refs_val:
             return False, "No component references specified"
 
-        refs = [r.strip().upper() for r in re.split(r'[,;\s]+', refs_str) if r.strip()]
+        if not isinstance(refs_val, list):
+            return False, "ALIGN_COMPONENTS.parameters.refs must be a list of references"
+
+        refs = [str(r).strip().upper() for r in refs_val if str(r or "").strip()]
         if len(refs) < 2:
             return False, "Need at least 2 components to align"
 

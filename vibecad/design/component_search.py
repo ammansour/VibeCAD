@@ -222,10 +222,27 @@ class ComponentWebSearch:
         with urlopen(req, timeout=15, context=_SSL_CTX) as resp:
             data = json.loads(resp.read().decode("utf-8"))
 
-        products = (data.get("result") or {}).get("productList") or []
+        # The EasyEDA API usually returns a dict, but under some error modes it
+        # can return a list (or other JSON) which previously crashed with:
+        #   "'list' object has no attribute 'get'"
+        if not isinstance(data, dict):
+            return []
+
+        result = data.get("result") or {}
+        if isinstance(result, list):
+            products = result
+        elif isinstance(result, dict):
+            products = result.get("productList") or []
+        else:
+            products = []
+
+        if not isinstance(products, list):
+            products = []
         results: List[ComponentInfo] = []
 
         for p in products:
+            if not isinstance(p, dict):
+                continue
             mpn = (p.get("mpn") or "").strip()
             if not mpn:
                 continue
@@ -243,15 +260,19 @@ class ComponentWebSearch:
                 package=pkg,
                 source="lcsc",
                 lcsc_number=lcsc,
-                stock=int(stock_val) if stock_val and str(stock_val).isdigit() else None,
+                stock=int(stock_val) if str(stock_val or "").strip().isdigit() else None,
                 product_url=f"https://www.lcsc.com/product-detail/{lcsc}.html" if lcsc else "",
                 datasheet_url="",
             )
 
             # Extract price breaks if available
             price_list = p.get("price") or p.get("priceList") or []
+            if isinstance(price_list, dict):
+                price_list = list(price_list.values())
             if isinstance(price_list, list):
                 for pb in price_list:
+                    if not isinstance(pb, dict):
+                        continue
                     try:
                         qty = int(pb.get("ladder") or pb.get("quantity") or 0)
                         price = float(pb.get("productPrice") or pb.get("price") or 0)

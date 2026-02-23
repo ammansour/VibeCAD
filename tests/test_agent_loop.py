@@ -21,6 +21,7 @@ from vibecad.design.design_agent import (
     DesignActionType,
     DesignAgent,
     DesignRequest,
+    normalize_action_parameters,
 )
 from vibecad.llm.client import LLMConfig, LLMResponse
 
@@ -34,11 +35,25 @@ class _FakeLLMClient:
 
     def __init__(self, responses=None):
         self.config = LLMConfig(api_key="test-key", max_tokens=256)
+        self.is_available = True
         self._responses = list(responses or [])
         self._call_count = 0
 
     def chat(self, messages, system_prompt=None):
         self._call_count += 1
+        # Sub-agents expect a JSON array response. Keep them inert for these
+        # state-machine tests so the loop falls through to the monolithic agent.
+        if system_prompt and "Return JSON array" in str(system_prompt):
+            content = "[]"
+            return LLMResponse(
+                content=content,
+                model="test",
+                raw_response={
+                    "choices": [
+                        {"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}
+                    ]
+                },
+            )
         if self._responses:
             content = self._responses.pop(0)
         else:
@@ -130,7 +145,7 @@ class TestAgentLoopStateMachine(unittest.TestCase):
         """AgentLoop should stop after max_iterations."""
         # Responses that never say DESIGN_COMPLETE
         responses = [
-            '{"assistant_message":"doing stuff","actions":[{"actiontype":"SEARCHPART","description":"search","parameters":{"query":"x"},"requiresApproval":false}]}'
+            '{"assistant_message":"doing stuff","actions":[{"actiontype":"SEARCH_PART","description":"search","parameters":{"query":"x"},"requiresApproval":false}]}'
         ] * 6  # More than max
 
         agent, _ = _make_agent(responses)
@@ -149,7 +164,7 @@ class TestAgentLoopStateMachine(unittest.TestCase):
         """Calling stop() should terminate the loop."""
         # Responses that keep going
         responses = [
-            '{"assistant_message":"step","actions":[{"actiontype":"SEARCHPART","description":"s","parameters":{"query":"x"},"requiresApproval":false}]}'
+            '{"assistant_message":"step","actions":[{"actiontype":"SEARCH_PART","description":"s","parameters":{"query":"x"},"requiresApproval":false}]}'
         ] * 50
 
         agent, _ = _make_agent(responses)
@@ -290,12 +305,109 @@ class TestLoopCompactionAndDedupe(unittest.TestCase):
 
         a1 = DesignAction(DesignActionType.SEARCH_PART, "Search", {"query": "ATmega328P"})
         a2 = DesignAction(DesignActionType.SEARCH_PART, "Search again", {"query": "atmega328p"})
+        a3 = DesignAction(DesignActionType.SEARCH_PART, "Search third time", {"query": "ATMEGA328P"})
 
         loop._execute_and_record(a1, {}, action_results, auto=True)
         loop._execute_and_record(a2, {}, action_results, auto=True)
+        loop._execute_and_record(a3, {}, action_results, auto=True)
 
-        self.assertTrue(any("SKIPPED" in r for r in action_results))
+        skipped = [r for r in action_results if "SKIPPED" in r]
+        self.assertGreaterEqual(len(skipped), 1)
         self.assertEqual(len(loop._history), 1)
+
+    def test_full_workflow_completion_gate(self):
+        agent, _ = _make_agent()
+        loop = AgentLoop(agent)
+        loop._goal = "build arduino uno from scratch"
+        loop._require_full_workflow = True
+        loop._last_drc_passed = True
+        loop._phase.update(
+            {
+                "outline_defined": True,
+                "components_placed": 1,
+                "nets_assigned": 0,
+                "routing_attempted": False,
+            }
+        )
+        ok, reason = loop._completion_requirements_met()
+        self.assertFalse(ok)
+        self.assertIn("component", reason.lower())
+
+    def test_error_messages_are_logged_to_debug(self):
+        agent, _ = _make_agent()
+        loop = AgentLoop(agent)
+
+        # Force a failing action that results in a user-facing "❌ ..." line.
+        def _fake_execute(action, context):
+            action.executed = True
+            action.success = False
+            action.result_message = "Missing component reference or location"
+            return action
+
+        loop._execute_action = _fake_execute  # type: ignore[method-assign]
+        action_results = []
+        action = DesignAction(
+            DesignActionType.MOVE_COMPONENT,
+            "Move component",
+            {"ref": "U1", "location": {"x": 10, "y": 20}},
+        )
+
+        with self.assertLogs("vibecad.design.agent_loop", level="DEBUG") as cm:
+            loop._execute_and_record(action, {}, action_results)
+
+        self.assertTrue(
+            any("❌ Missing component reference or location" in line for line in cm.output),
+            f"Expected debug log for failure, got: {cm.output}",
+        )
+
+    def test_phase_gate_blocks_are_logged_to_debug(self):
+        agent, _ = _make_agent()
+        loop = AgentLoop(agent)
+        loop._phase["outline_defined"] = True
+
+        action_results = []
+        action = DesignAction(
+            DesignActionType.DEFINE_BOARD_OUTLINE,
+            "Define board outline",
+            {"width_mm": 80.0, "height_mm": 50.0, "center": {"x": 150.0, "y": 100.0}},
+        )
+
+        with self.assertLogs("vibecad.design.agent_loop", level="DEBUG") as cm:
+            loop._execute_and_record(action, {}, action_results)
+
+        self.assertTrue(
+            any("⛔ Board outline is already defined" in line for line in cm.output),
+            f"Expected debug log for phase gate block, got: {cm.output}",
+        )
+
+    def test_normalize_action_parameters_uses_ref_and_location_object(self):
+        params = {"id": "U1", "location": [150.0, 100.0], "reference": "U1-ignored"}
+        norm = normalize_action_parameters(DesignActionType.MOVE_COMPONENT, params)
+        self.assertEqual(norm.get("ref"), "U1")
+        self.assertNotIn("id", norm)
+        self.assertNotIn("reference", norm)
+        self.assertIsInstance(norm.get("location"), dict)
+        self.assertEqual(norm["location"]["x"], 150.0)
+        self.assertEqual(norm["location"]["y"], 100.0)
+
+    def test_normalize_align_components_refs_is_list(self):
+        norm = normalize_action_parameters(
+            DesignActionType.ALIGN_COMPONENTS,
+            {"refs": ["j1", " U2 ", None], "direction": "horizontal"},
+        )
+        self.assertEqual(norm["refs"], ["J1", "U2"])
+
+    def test_normalize_assign_nets_from_net_name_and_pads(self):
+        norm = normalize_action_parameters(
+            DesignActionType.ASSIGN_NETS,
+            {"net_name": "GND", "pads": ["U1:3", "u1/5", "bad", "J1-4"]},
+        )
+        assigns = norm.get("assignments")
+        self.assertIsInstance(assigns, list)
+        self.assertGreaterEqual(len(assigns), 3)
+        self.assertTrue(any(a.get("ref") == "U1" and a.get("pad") == "3" for a in assigns))
+        self.assertTrue(any(a.get("ref") == "U1" and a.get("pad") == "5" for a in assigns))
+        self.assertTrue(any(a.get("ref") == "J1" and a.get("pad") == "4" for a in assigns))
 
 
 # ---------------------------------------------------------------------------
@@ -383,7 +495,7 @@ class TestPauseResume(unittest.TestCase):
 
     def test_pause_sets_state(self):
         responses = [
-            '{"assistant_message":"searching","actions":[{"actiontype":"SEARCHPART","description":"s","parameters":{"query":"x"},"requiresApproval":false}]}'
+            '{"assistant_message":"searching","actions":[{"actiontype":"SEARCH_PART","description":"s","parameters":{"query":"x"},"requiresApproval":false}]}'
         ] * 20
 
         agent, _ = _make_agent(responses)
