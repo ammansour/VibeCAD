@@ -250,10 +250,11 @@ class CircuitContextBuilder:
         return "\n".join(lines)
 
     def _extract_refs(self, query: str, snap: CircuitSnapshot) -> Set[str]:
-        """Extract component references mentioned in the query."""
+        """Extract component references mentioned in the query without hardcoded regex patterns."""
         found = set()
-        for m in _REF_PATTERN.finditer(query.upper()):
-            candidate = m.group(1)
+        # Find all words, allowing some punctuation
+        words = re.findall(r'\b[A-Za-z0-9_]+\b', query.upper())
+        for candidate in words:
             if candidate in snap.components:
                 found.add(candidate)
         # Also match by value or partial name (e.g. "the resistor" → all R*)
@@ -271,13 +272,17 @@ class CircuitContextBuilder:
         return found
 
     def _extract_nets(self, query: str, snap: CircuitSnapshot) -> Set[str]:
-        """Extract net names mentioned in the query."""
+        """Extract net names mentioned in the query without hardcoded regex patterns."""
         found = set()
-        for m in _NET_PATTERN.finditer(query):
-            candidate = m.group(1).upper()
-            # Try case-insensitive match against known nets
+        # Extract potential net names, keeping original case for matching
+        # Also clean up punctuation
+        clean_query = re.sub(r'[^a-zA-Z0-9_\+]+', ' ', query)
+        words = set(clean_query.split())
+        for candidate in words:
+            candidate_up = candidate.upper()
             for net_name in snap.nets:
-                if net_name.upper() == candidate or candidate in net_name.upper():
+                net_up = net_name.upper()
+                if net_up == candidate_up or candidate_up in net_up:
                     found.add(net_name)
         return found
 

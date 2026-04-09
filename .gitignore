@@ -18,3 +18,11 @@ build/
 *.kicad_pro-bak
 *.kicad_prl
 *.kicad_prl-bak
+
+# Local settings / credentials
+vibecad_settings.json
+vibecad/vibecad_settings.json
+vibecad_api_key.local.txt
+vibecad/vibecad_api_key.local.txt
+still-algebra-489107-j3-d571e2c2dcb8.json
+vibecad/still-algebra-489107-j3-d571e2c2dcb8.json

@@ -22,17 +22,13 @@ try:
     from .sub_agents import (
         SubAgent,
         SubAgentResult,
-        InfoGatheringAgent,
-        PlacementAgent,
-        RoutingAgent,
-        VerificationAgent,
+        ComponentCheckAgent,
         Orchestrator,
         DesignPhase,
     )
     _SUBAGENTS = [
         'SubAgent', 'SubAgentResult',
-        'InfoGatheringAgent', 'PlacementAgent',
-        'RoutingAgent', 'VerificationAgent',
+        'ComponentCheckAgent',
         'Orchestrator', 'DesignPhase',
     ]
 except ImportError:

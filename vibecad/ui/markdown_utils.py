@@ -523,23 +523,51 @@ def html_document(
     bg_hex: str = "#ffffff",
     fg_hex: str = "#000000",
     border_hex: Optional[str] = None,
+    text_align: str = "left",
+    animate: bool = True,
+    color_scheme: str = "light",
 ) -> str:
     border_hex = border_hex or fg_hex
+    text_align = text_align if text_align in ("left", "right", "center", "justify") else "left"
+    color_scheme = color_scheme if color_scheme in ("light", "dark") else "light"
+
+    animation_rule = ""
+    if animate:
+        animation_rule = """
+        animation: vibecad-message-in 520ms cubic-bezier(0.2, 1, 0.22, 1) both;
+        will-change: transform, opacity;
+        """
 
     # Avoid inner boxes: code blocks and tables inherit background.
     css = f"""
     html, body {{
         margin: 0;
         padding: 0;
-        background: {bg_hex};
-        color: {fg_hex};
+        width: 100%;
+        height: 100%;
+        min-height: 100%;
+        overflow-y: hidden;
+        background-color: {bg_hex} !important;
+        background: {bg_hex} !important;
+        color: {fg_hex} !important;
+        color-scheme: {color_scheme};
         font-family: sans-serif;
         font-size: 14px;
         line-height: 1.35;
     }}
     p {{ margin: 0 0 8px 0; }}
+    p:last-child {{ margin-bottom: 0; }}
     h1, h2, h3 {{ margin: 0 0 8px 0; font-size: 15px; }}
     code {{ font-family: monospace; }}
+    .vibecad-message {{
+        width: 100%;
+        min-height: 100%;
+        box-sizing: border-box;
+        text-align: {text_align};
+        transform-origin: top {'right' if text_align == 'right' else 'left'};
+        {animation_rule}
+    }}
+    .vibecad-message > * {{ max-width: 100%; }}
     pre {{
         margin: 6px 0;
         padding: 0;
@@ -564,7 +592,12 @@ def html_document(
 
     /* Keep text size unchanged for scripts; only shift baseline. */
     sub, sup {{ font-size: 1em; line-height: 1; }}
+
+    @keyframes vibecad-message-in {{
+        from {{ opacity: 0; transform: translate3d(0, 8px, 0) scale(0.985); }}
+        to {{ opacity: 1; transform: translate3d(0, 0, 0) scale(1); }}
+    }}
     """
 
-    body = fragment or ""
-    return f"<!doctype html><html><head><meta charset=\"utf-8\"><style>{css}</style></head><body>{body}</body></html>"
+    body = f'<div class="vibecad-message">{fragment or ""}</div>'
+    return f"<!doctype html><html style=\"background-color:{bg_hex};color-scheme:{color_scheme};\"><head><meta charset=\"utf-8\"><meta name=\"color-scheme\" content=\"{color_scheme}\"><style>{css}</style></head><body style=\"background-color:{bg_hex};color:{fg_hex};\">{body}</body></html>"

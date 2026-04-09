@@ -1,0 +1,23 @@
+{
+  "api_base": "",
+  "api_key": "",
+  "ca_bundle_path": "",
+  "digikey_client_id": "",
+  "digikey_client_secret": "",
+  "enable_thinking": true,
+  "github_token": "",
+  "llm_provider": "vertex",
+  "max_tokens": 20000,
+  "model": "google/gemini-3-flash-preview",
+  "temperature": 0.7,
+  "thinking_budget": null,
+  "thinking_output_enabled": true,
+  "timeout": null,
+  "top_p": null,
+  "verbose": false,
+  "verify_ssl": false,
+  "vertex_credentials_path": "",
+  "vertex_location": "",
+  "vertex_project": "",
+  "yolo_auto_apply": true
+}

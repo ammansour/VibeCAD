@@ -19,6 +19,7 @@ import ssl
 import tempfile
 import time
 import zipfile
+from difflib import SequenceMatcher
 from dataclasses import dataclass, field
 from enum import Enum
 from glob import glob
@@ -103,12 +104,22 @@ class DownloadResult:
     error: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class FootprintCompatibility:
+    requested: str
+    candidate: str
+    matched: bool
+    match_kind: str
+    score: int = 0
+    reason: str = ""
+
+
 # Consolidated list of IC package families recognised across the codebase.
 # Used by _extract_package_hint, _extract_package_from_desc, and _package_family.
 _PACKAGE_FAMILIES = (
     'HTSSOP', 'TSSOP', 'MSOP', 'LFCSP', 'WQFN',
     'PDIP', 'DIP', 'TQFP', 'LQFP', 'QFN', 'UQFN', 'VQFN',
-    'DFN', 'SOIC', 'SOP', 'SO', 'SSOP', 'LSSOP', 'SOT', 'BGA', 'QFP',
+    'DFN', 'SOIC', 'SOP', 'SO', 'SSOP', 'LSSOP', 'VSSOP', 'SOT', 'BGA', 'QFP',
     'VFBGA', 'UFBGA', 'DRQFN', 'TFBGA', 'PLCC', 'XSON',
 )
 # Regex that matches e.g. "TSSOP-28", "QFN-32", etc.
@@ -234,6 +245,67 @@ def _looks_like_mpn(query: str) -> bool:
     return False
 
 
+def _normalize_mpn_token(text: str) -> str:
+    """Normalize a part-number-like token for fuzzy exact-match checks."""
+    s = (text or "").strip().upper()
+    s = re.sub(r"[\s_:/\\.-]+", "", s)
+    s = re.sub(r"[^A-Z0-9+]", "", s)
+    return s
+
+
+def _extract_primary_mpn_token(query: str) -> str:
+    """Extract the most likely MPN token from a mixed query string."""
+    q = (query or "").strip()
+    if not q:
+        return ""
+    # Prefer a token that contains both letters and digits.
+    tokens = re.split(r"\s+", q)
+    candidates: List[str] = []
+    for t in tokens[:6]:
+        t = t.strip(" ,;()[]{}")
+        if len(t) < 4:
+            continue
+        if re.search(r"[A-Za-z]", t) and re.search(r"\d", t):
+            candidates.append(t)
+    if candidates:
+        return candidates[0]
+    # Fallback: any long-ish token.
+    for t in tokens[:4]:
+        t = t.strip(" ,;()[]{}")
+        if len(t) >= 6:
+            return t
+    return ""
+
+
+def _results_contain_mpn(results: List["LibraryItem"], mpn_token: str) -> bool:
+    if not results or not mpn_token:
+        return False
+    target = _normalize_mpn_token(mpn_token)
+    if len(target) < 6:
+        return False
+    for item in results:
+        try:
+            hay = _normalize_mpn_token(getattr(item, "mpn", "") or "") + " " + _normalize_mpn_token(getattr(item, "name", "") or "")
+            if target and target in hay.replace(" ", ""):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _results_have_usable_footprint(results: List["LibraryItem"]) -> bool:
+    """True if any result can be placed without additional guessing."""
+    for item in results or []:
+        try:
+            if getattr(item, "local_footprint_path", None):
+                return True
+            if getattr(item, "footprint_url", None):
+                return True
+        except Exception:
+            continue
+    return False
+
+
 class LibraryManager:
     """Manages symbol and footprint library operations.
     
@@ -251,6 +323,10 @@ class LibraryManager:
     def __init__(self,
                  kicad_user_lib_path: Optional[str] = None,
                  snapeda_api_key: Optional[str] = None,
+                 llm_client: Optional[Any] = None,
+                 github_token: Optional[str] = None,
+                 enable_easyeda_sources: bool = False,
+                 enable_snapeda_sources: bool = False,
                  enable_github_sources: bool = False,
                  github_cache_dir: Optional[str] = None,
                  github_curated_dirs: Optional[List[str]] = None,
@@ -264,8 +340,21 @@ class LibraryManager:
         """
         self.kicad_user_lib_path = kicad_user_lib_path or self._detect_kicad_lib_path()
         self.snapeda_api_key = snapeda_api_key or os.environ.get('SNAPEDA_API_KEY', '')
+        self._llm_client = llm_client
+        # GitHub search increasingly requires authentication; disable by default
+        # when a token isn't available to avoid repeated 401 noise.
+        self.github_token = (
+            str(github_token or "").strip()
+            or os.environ.get('GITHUB_TOKEN', '').strip()
+            or os.environ.get('GH_TOKEN', '').strip()
+            or os.environ.get('GITHUB_API_TOKEN', '').strip()
+        )
+        self._warned_no_github_token = False
+        self._warned_no_snapeda_key = False
 
         # Optional, keyless providers (disabled by default to keep tests/offline runs stable)
+        self.enable_easyeda_sources = bool(enable_easyeda_sources)
+        self.enable_snapeda_sources = bool(enable_snapeda_sources)
         self.enable_github_sources = bool(enable_github_sources)
         self.enable_github_search = bool(enable_github_search)
 
@@ -348,6 +437,137 @@ class LibraryManager:
     def set_progress_callback(self, callback: Callable):
         """Set callback for progress updates."""
         self._on_progress = callback
+
+    def set_llm_client(self, llm_client: Optional[Any]) -> None:
+        self._llm_client = llm_client
+
+    def _llm_available(self) -> bool:
+        return bool(self._llm_client is not None and getattr(self._llm_client, "is_available", False))
+
+    @classmethod
+    def _canonical_alias_candidate_key(cls, fp_id: str) -> str:
+        raw = str(fp_id or "").strip()
+        tail = raw.split(":", 1)[1] if ":" in raw else raw
+        tail = re.sub(r'_(?:HandSolder|HandSoldering)$', '', tail, flags=re.IGNORECASE)
+        return cls._norm_footprint_id(tail)
+
+    @classmethod
+    def _candidate_preference_tuple(cls, requested: str, row: Tuple[int, str, str]) -> Tuple[int, int, int, int, int, int]:
+        score, fp_id, _path = row
+        raw = str(fp_id or "")
+        tail = raw.split(":", 1)[1] if ":" in raw else raw
+        req_raw = str(requested or "")
+        compatibility = cls.assess_footprint_id_compatibility(requested, fp_id)
+        match_priority = {
+            "exact": 4,
+            "package": 3,
+            "passive-package": 3,
+            "resonator-family": 3,
+            "connector-family": 2,
+            "alias": 1,
+        }.get(compatibility.match_kind, 0)
+        non_handsolder = 1 if not re.search(r'_(?:HandSolder|HandSoldering)$', tail, flags=re.IGNORECASE) else 0
+        standard_lib = 1 if not raw.startswith("VibeCAD:") else 0
+        req_dims = cls._footprint_dims_mm(req_raw)
+        cand_dims = cls._footprint_dims_mm(fp_id)
+        dim_priority = 0
+        if req_dims and cand_dims:
+            delta = abs(req_dims[0] - cand_dims[0]) + abs(req_dims[1] - cand_dims[1])
+            dim_priority = max(0, 1000 - int(delta * 1000))
+        req_lower = req_raw.lower()
+        cand_lower = raw.lower()
+        if "horizontal" in req_lower:
+            orientation_priority = 2 if "horizontal" in cand_lower else 0
+        elif "vertical" in req_lower:
+            orientation_priority = 2 if "vertical" in cand_lower else 0
+        else:
+            orientation_priority = 1 if "horizontal" in cand_lower else 0
+        req_key = cls._canonical_alias_candidate_key(req_raw)
+        cand_key = cls._canonical_alias_candidate_key(raw)
+        name_similarity = int(1000 * SequenceMatcher(None, req_key, cand_key).ratio()) if req_key and cand_key else 0
+        return (int(score), match_priority, name_similarity, dim_priority, non_handsolder, standard_lib + orientation_priority)
+
+    @classmethod
+    def _dedupe_alias_candidates(cls, requested: str, candidates: List[Tuple[int, str, str]]) -> List[Tuple[int, str, str]]:
+        grouped: Dict[str, Tuple[int, str, str]] = {}
+        for row in candidates:
+            key = cls._canonical_alias_candidate_key(row[1])
+            existing = grouped.get(key)
+            if existing is None or cls._candidate_preference_tuple(requested, row) > cls._candidate_preference_tuple(requested, existing):
+                grouped[key] = row
+        out = list(grouped.values())
+        out.sort(key=lambda row: (-cls._candidate_preference_tuple(requested, row)[0], -cls._candidate_preference_tuple(requested, row)[1], -cls._candidate_preference_tuple(requested, row)[2], -cls._candidate_preference_tuple(requested, row)[3], -cls._candidate_preference_tuple(requested, row)[4], -cls._candidate_preference_tuple(requested, row)[5], row[1]))
+        return out
+
+    def _rank_local_alias_candidates_with_llm(
+        self,
+        requested: str,
+        candidates: List[Tuple[int, str, str]],
+    ) -> Optional[str]:
+        if not self._llm_available() or len(candidates) < 2:
+            return None
+
+        shortlisted = self._dedupe_alias_candidates(requested, candidates[:5])[:5]
+        candidate_map = {fp_id: path for _, fp_id, path in shortlisted}
+        candidate_rows: List[Dict[str, Any]] = []
+        for score, fp_id, _path in shortlisted:
+            compatibility = self.assess_footprint_id_compatibility(requested, fp_id)
+            candidate_rows.append(
+                {
+                    "footprint_id": fp_id,
+                    "score": score,
+                    "match_kind": compatibility.match_kind,
+                    "match_reason": compatibility.reason,
+                    "dims_mm": self._footprint_dims_mm(fp_id),
+                    "tokens": self._footprint_anchor_tokens(fp_id),
+                }
+            )
+
+        system_prompt = (
+            "You are a cautious KiCad footprint alias reviewer. "
+            "Choose a candidate only when it is clearly the same local footprint family and package as the request. "
+            "Prefer no match over a risky substitution. "
+            "Return only JSON with keys chosen, confidence, and reason. "
+            "chosen must be exactly one of the provided footprint_id values or an empty string. "
+            "Use confidence=high only for clear equivalence, otherwise use none."
+        )
+        prompt = json.dumps(
+            {
+                "requested_footprint": requested,
+                "requested_dims_mm": self._footprint_dims_mm(requested),
+                "requested_tokens": self._footprint_anchor_tokens(requested),
+                "candidates": candidate_rows,
+                "instructions": [
+                    "Select only from the provided local candidates.",
+                    "Do not broaden to a different series, size, connector variant, or package family.",
+                    "If the candidates are ambiguous or not clearly equivalent, return an empty chosen value.",
+                ],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+
+        try:
+            from ..llm.client import LLMMessage
+            from .design_actions import sanitize_llm_json_text, _extract_json_object
+
+            resp = self._llm_client.chat(
+                [LLMMessage(role="user", content=prompt)],
+                system_prompt=system_prompt,
+                response_format={"type": "json_object"},
+            )
+            raw_text = getattr(resp, "content", "") or ""
+            cleaned = sanitize_llm_json_text(raw_text)
+            obj_text = _extract_json_object(cleaned) or cleaned
+            data = json.loads(obj_text)
+            chosen = str(data.get("chosen", "") or "").strip()
+            confidence = str(data.get("confidence", "") or "").strip().lower()
+            if confidence not in {"high", "medium"}:
+                return None
+            return candidate_map.get(chosen)
+        except Exception as e:
+            logger.warning("LLM alias ranking skipped for %s: %s", requested, e)
+            return None
     
     async def search_parts(self, query: str,
                           source: Optional[LibrarySource] = None,
@@ -379,9 +599,19 @@ class LibraryManager:
         2. KiCad online symbol index — kicad.github.io (prefix + keyword mapped)
         3. SnapEDA (needs API key)
         """
-        cache_key = f"{source}:{query}:{limit}"
-        if cache_key in self._search_cache:
-            return self._search_cache[cache_key]
+        # Cache by (source, normalized query) rather than by limit to avoid
+        # repeating expensive local scans and network calls when callers ask
+        # the same query with different limits (common in planning vs execution).
+        norm_q = str(query or "").strip().lower()
+        norm_q = norm_q.replace("_", " ")
+        norm_q = re.sub(r"\s+", " ", norm_q).strip()
+        cache_key = f"{source}:{norm_q}"
+        cached = self._search_cache.get(cache_key)
+        if isinstance(cached, list) and cached:
+            if int(limit or 0) <= 0:
+                return cached
+            if len(cached) >= int(limit):
+                return cached[: int(limit)]
 
         # Guardrail: value-only queries are extremely ambiguous and tend to
         # match arbitrary MPNs (e.g. "100nF" matching a MOSFET with "100N" in
@@ -398,14 +628,32 @@ class LibraryManager:
             # Caller chose a specific source
             results = self._search_source(source, query, limit)
         else:
+            mpn_token = _extract_primary_mpn_token(query) if _looks_like_mpn(query) else ""
+
             # 1. Local KiCad library scan (fast, works offline)
             results = self._search_kicad_local(query, limit)
+            # If we got *something* but it doesn't look like the requested MPN,
+            # treat it as a non-match and fall through to other sources.
+            if results and mpn_token and not _results_contain_mpn(results, mpn_token):
+                results = []
+
             # 2. Online KiCad index (prefix + keyword matching)
             if not results:
                 results = self._search_kicad_builtin_sync(query, limit)
+                if results and mpn_token and not _results_contain_mpn(results, mpn_token):
+                    results = []
+
             # 3. EasyEDA/LCSC (free, no auth, large DB)
-            if not results:
-                results = self._search_easyeda_sync(query, limit)
+            # If local/builtin did not yield an exactish MPN match, query LCSC.
+            if not results and self.enable_easyeda_sources:
+                easy = self._search_easyeda_sync(query, limit)
+                # Keep EasyEDA results, but if none provide a usable footprint,
+                # continue into other sources (SnapEDA, GitHub, etc.) so the
+                # caller can download/resolve a real footprint when needed.
+                results = easy
+                if easy and not _results_have_usable_footprint(easy):
+                    results = []
+
             # 4. GitHub curated repos (optional, keyless)
             if not results and self.enable_github_sources:
                 results = self._search_github_curated_local(query, limit)
@@ -413,11 +661,13 @@ class LibraryManager:
             if not results and self.enable_github_sources and self.enable_github_search:
                 results = self._search_github_search_sync(query, limit)
             # 6. SnapEDA
-            if not results:
+            if not results and self.enable_snapeda_sources:
                 results = self._search_snapeda_sync(query, limit)
 
         self._search_cache[cache_key] = results
-        return results
+        if int(limit or 0) <= 0:
+            return results
+        return results[: int(limit)]
 
     def _find_local_footprint_path(self, lib: str, name: str) -> Optional[str]:
         """Return absolute path for a KiCad built-in footprint lib/name, if present."""
@@ -435,6 +685,738 @@ class LibraryManager:
             if fp_lib == target_lib and fp_name == target_name:
                 return str(file_path)
         return None
+
+    def _find_local_footprint_path_ci(self, lib: str, name: str) -> Optional[str]:
+        """Case-insensitive lookup for a library-qualified footprint name."""
+        if not lib or not name:
+            return None
+        try:
+            index = self._build_local_index()
+        except Exception:
+            return None
+        target_lib = str(lib).strip().lower()
+        target_name = str(name).strip().lower()
+        for _, fp_name, fp_lib, etype, file_path in index:
+            if etype != "footprint" or not file_path:
+                continue
+            if str(fp_lib).strip().lower() == target_lib and str(fp_name).strip().lower() == target_name:
+                return str(file_path)
+        return None
+
+    def _find_local_footprint_paths_by_name_ci(self, name: str) -> List[Tuple[str, str, str]]:
+        """Return all case-insensitive local footprint matches for a footprint name."""
+        if not name:
+            return []
+        try:
+            index = self._build_local_index()
+        except Exception:
+            return []
+        target_name = str(name).strip().lower()
+        matches: List[Tuple[str, str, str]] = []
+        for _, fp_name, fp_lib, etype, file_path in index:
+            if etype != "footprint" or not file_path:
+                continue
+            if str(fp_name).strip().lower() == target_name:
+                matches.append((str(fp_lib), str(fp_name), str(file_path)))
+        return matches
+
+    @staticmethod
+    def _canonicalize_footprint_text(value: str) -> str:
+        s = str(value or "").strip().lower()
+
+        def _canon_num(match: re.Match[str]) -> str:
+            text = match.group(0)
+            try:
+                num = float(text)
+            except Exception:
+                return text
+            if num.is_integer():
+                return str(int(num))
+            return text.rstrip("0").rstrip(".")
+
+        return re.sub(r"\d+\.\d+", _canon_num, s)
+
+    @classmethod
+    def _norm_footprint_id(cls, value: str) -> str:
+        s = cls._canonicalize_footprint_text(value)
+        return re.sub(r"[^a-z0-9]+", "", s)
+
+    @classmethod
+    def _footprint_tokens(cls, value: str) -> List[str]:
+        raw = str(value or "").strip()
+        if ":" in raw:
+            raw = raw.split(":", 1)[1].strip()
+        s = cls._canonicalize_footprint_text(raw)
+        return [tok for tok in re.split(r"[^a-z0-9]+", s) if tok]
+
+    @classmethod
+    def _footprint_anchor_tokens(cls, value: str) -> List[str]:
+        generic = {
+            "package", "connector", "button", "switch", "crystal", "resonator",
+            "smd", "tht", "metric", "vertical", "horizontal", "pin", "header",
+            "socket", "footprint", "pretty", "mm",
+        }
+        anchors: List[str] = []
+        for tok in cls._footprint_tokens(value):
+            if tok in generic:
+                continue
+            if len(tok) >= 4 or any(ch.isdigit() for ch in tok):
+                anchors.append(tok)
+        return anchors
+
+    @staticmethod
+    def _is_dimension_token(token: str) -> bool:
+        tok = str(token or "").strip().lower()
+        if not tok:
+            return False
+        return bool(
+            re.fullmatch(r"\d+(?:\.\d+)?", tok)
+            or re.fullmatch(r"\d+x\d+", tok)
+            or re.fullmatch(r"p\d+(?:\.\d+)?", tok)
+            or re.fullmatch(r"\d+pin", tok)
+        )
+
+    @classmethod
+    def _is_passive_footprint_library(cls, value: str) -> bool:
+        raw = str(value or "").strip()
+        lib = raw.split(":", 1)[0] if ":" in raw else raw
+        lib_norm = cls._norm_footprint_id(lib)
+        if not lib_norm:
+            return False
+        return any(
+            token in lib_norm
+            for token in (
+                "capacitor",
+                "resistor",
+                "inductor",
+                "diode",
+                "led",
+                "fuse",
+                "varistor",
+            )
+        )
+
+    @classmethod
+    def _is_generic_package_footprint_library(cls, value: str) -> bool:
+        raw = str(value or "").strip()
+        lib = raw.split(":", 1)[0] if ":" in raw else raw
+        lib_norm = cls._norm_footprint_id(lib)
+        return bool(lib_norm and lib_norm.startswith("package"))
+
+    @classmethod
+    def _footprint_mount_style(cls, value: str) -> str:
+        raw_norm = cls._norm_footprint_id(value)
+        if not raw_norm:
+            return ""
+        if "smd" in raw_norm:
+            return "smd"
+        if "tht" in raw_norm:
+            return "tht"
+        return ""
+
+    @classmethod
+    def _connector_orientation(cls, value: str) -> str:
+        raw = str(value or "").strip().lower()
+        if not raw:
+            return ""
+        if "horizontal" in raw:
+            return "horizontal"
+        if "vertical" in raw:
+            return "vertical"
+        return ""
+
+    @classmethod
+    def _connector_shape_tokens(cls, value: str) -> List[str]:
+        raw = str(value or "").strip().lower()
+        if not raw:
+            return []
+        lib = raw.split(":", 1)[0].strip() if ":" in raw else ""
+        if not cls._norm_footprint_id(lib).startswith("connector"):
+            return []
+
+        name = raw.split(":", 1)[1].strip() if ":" in raw else raw
+        tokens = [tok for tok in re.split(r"[^a-z0-9]+", name) if tok]
+        if not tokens:
+            return []
+
+        generic_tokens = {
+            "connector", "conn", "socket", "plug", "receptacle", "header",
+            "male", "female", "mount", "through", "hole", "holes",
+            "horizontal", "vertical", "right", "angle", "ra",
+            "smd", "smt", "tht", "pitch", "pin", "pins", "row", "rows",
+        }
+
+        filtered = [tok for tok in tokens if tok not in generic_tokens]
+        shape_tokens: List[str] = []
+        form_factor_tokens = {"a", "b", "c"}
+        for idx, tok in enumerate(filtered):
+            prev_tok = filtered[idx - 1] if idx > 0 else ""
+            next_tok = filtered[idx + 1] if idx + 1 < len(filtered) else ""
+            if any(ch.isdigit() for ch in tok):
+                continue
+            if tok.isalpha() and len(tok) >= 3:
+                adjacent_model = any(ch.isdigit() for ch in prev_tok) or any(ch.isdigit() for ch in next_tok)
+                likely_vendor = idx == 1 and next_tok and (
+                    any(ch.isdigit() for ch in next_tok)
+                    or (len(next_tok) <= 3 and next_tok not in form_factor_tokens)
+                )
+                if adjacent_model or likely_vendor:
+                    continue
+            shape_tokens.append(tok)
+
+        return shape_tokens
+
+    @classmethod
+    def _is_connector_family_alias(cls, requested: str, candidate: str) -> bool:
+        req_raw = str(requested or "").strip()
+        cand_raw = str(candidate or "").strip()
+        if not req_raw or not cand_raw:
+            return False
+        req_lib = cls._norm_footprint_id(req_raw.split(":", 1)[0] if ":" in req_raw else "")
+        cand_lib = cls._norm_footprint_id(cand_raw.split(":", 1)[0] if ":" in cand_raw else "")
+        if not req_lib or req_lib != cand_lib or not req_lib.startswith("connector"):
+            return False
+
+        req_orientation = cls._connector_orientation(req_raw)
+        cand_orientation = cls._connector_orientation(cand_raw)
+        if req_orientation and cand_orientation and req_orientation != cand_orientation:
+            return False
+
+        req_shape = cls._connector_shape_tokens(req_raw)
+        cand_shape = cls._connector_shape_tokens(cand_raw)
+        if not req_shape or not cand_shape:
+            return False
+        return req_shape == cand_shape
+
+    @classmethod
+    def _usb_connector_variant(cls, value: str) -> str:
+        tokens = cls._footprint_tokens(value)
+        if not tokens:
+            return ""
+        for idx, tok in enumerate(tokens):
+            if tok in {"usba", "usbb", "usbc"}:
+                return tok
+            if tok in {"microusb", "miniusb"}:
+                return tok
+            if tok != "usb":
+                continue
+            nxt = tokens[idx + 1] if idx + 1 < len(tokens) else ""
+            if nxt in {"a", "b", "c"}:
+                return f"usb{nxt}"
+            if nxt in {"micro", "mini"}:
+                return f"{nxt}usb"
+        return ""
+
+    @classmethod
+    def _is_resonator_family_alias(cls, requested: str, candidate: str) -> bool:
+        # Include the library portion (e.g. "RESONATOR_SMD:") in the keyword check
+        # so that RESONATOR_SMD:MURATA_CSTNE_G_... is recognised as a resonator
+        # even though the name part alone lacks the word "resonator".
+        req_full_norm = cls._norm_footprint_id(requested)
+        cand_full_norm = cls._norm_footprint_id(candidate)
+        if "resonator" not in req_full_norm or "resonator" not in cand_full_norm:
+            return False
+        if "murata" not in req_full_norm or "murata" not in cand_full_norm:
+            return False
+
+        # Use name-part tokens for the CST product-line check
+        req_tokens = set(cls._footprint_tokens(requested))
+        cand_tokens = set(cls._footprint_tokens(candidate))
+        req_family = next((tok for tok in req_tokens if tok.startswith("cst")), "")
+        cand_family = next((tok for tok in cand_tokens if tok.startswith("cst")), "")
+        if not req_family or not cand_family:
+            return False
+        # The strict prefix check (cstne vs cstxexxv) is too narrow.
+        # Both must simply be in the CST product line; the dimension gate below
+        # handles any remaining size mismatch.
+        if not (req_family.startswith("cst") and cand_family.startswith("cst")):
+            return False
+
+        req_dims = cls._footprint_dims_mm(requested)
+        cand_dims = cls._footprint_dims_mm(candidate)
+        if req_dims and cand_dims:
+            delta = abs(req_dims[0] - cand_dims[0]) + abs(req_dims[1] - cand_dims[1])
+            if delta > 0.8:
+                return False
+        return True
+
+    @classmethod
+    def _has_footprint_family_conflict(cls, requested: str, candidate: str) -> bool:
+        req_tokens = set(cls._footprint_tokens(requested))
+        cand_tokens = set(cls._footprint_tokens(candidate))
+        req_usb_variant = cls._usb_connector_variant(requested)
+        cand_usb_variant = cls._usb_connector_variant(candidate)
+        if req_usb_variant and cand_usb_variant and req_usb_variant != cand_usb_variant:
+            return True
+        req_generic_pkg = cls._is_generic_package_footprint_library(requested)
+        cand_generic_pkg = cls._is_generic_package_footprint_library(candidate)
+        if req_generic_pkg != cand_generic_pkg:
+            return True
+        req_mount = cls._footprint_mount_style(requested)
+        cand_mount = cls._footprint_mount_style(candidate)
+        if req_mount and cand_mount and req_mount != cand_mount:
+            return True
+        # Type-keyword conflict detection (e.g. resonator vs crystal, 2-pin vs
+        # 3-pin).  We use the *full* footprint ID (library + name) but give the
+        # name part priority over the library prefix: KiCad stores resonators
+        # inside the "Crystal:" library, so Crystal:Resonator_SMD_Murata_...
+        # must be classified as "resonator" rather than "crystal".
+        token_groups = (
+            {"resonator", "crystal"},
+            {"2pin", "3pin", "4pin"},
+        )
+
+        def _dominant_kw(fp_id: str, group: set) -> set:
+            lib_s = fp_id.split(":", 1)[0] if ":" in fp_id else ""
+            name_s = fp_id.split(":", 1)[1] if ":" in fp_id else fp_id
+            name_toks = set(
+                tok for tok in re.split(r"[^a-z0-9]+", cls._canonicalize_footprint_text(name_s)) if tok
+            )
+            name_hit = group & name_toks
+            if name_hit:
+                return name_hit
+            lib_toks = set(
+                tok for tok in re.split(r"[^a-z0-9]+", cls._canonicalize_footprint_text(lib_s)) if tok
+            )
+            return group & lib_toks
+
+        for group in token_groups:
+            req_present = _dominant_kw(requested, group)
+            cand_present = _dominant_kw(candidate, group)
+            if req_present and cand_present and req_present != cand_present:
+                return True
+        return False
+
+    @classmethod
+    def _package_signature(cls, value: str) -> Tuple[str, str, int]:
+        raw = str(value or "").strip()
+        if not raw:
+            return "", "", 0
+
+        match = re.search(
+            r"\b(?:DIP|PDIP|QFN|DFN|TQFP|LQFP|QFP|SOIC|SOT|SSOP|TSSOP|HTSSOP|MSOP|SOP|SO|VSSOP|LGA|BGA|TO)-?\d+(?:-\d+)?",
+            raw,
+            re.IGNORECASE,
+        )
+        package = str(match.group(0) if match else cls._extract_package_hint(raw) or "").upper()
+        if not package:
+            return "", "", 0
+        family = cls._package_family(package)
+        pin_count = _extract_expected_pin_count(package, package)
+        return package, family, pin_count
+
+    @classmethod
+    def _is_package_hint_compatible(cls, requested: str, candidate: str) -> bool:
+        req_pkg, req_family, req_pin_count = cls._package_signature(requested)
+        cand_pkg, cand_family, cand_pin_count = cls._package_signature(candidate)
+        if not req_pkg or not cand_pkg:
+            return False
+        if req_pkg == cand_pkg:
+            return True
+        if req_family and cand_family and req_family != cand_family:
+            return False
+        if req_pin_count and cand_pin_count and req_pin_count != cand_pin_count:
+            return False
+
+        req_norm = cls._norm_footprint_id(req_pkg)
+        cand_norm = cls._norm_footprint_id(cand_pkg)
+        if req_norm and cand_norm and (req_norm == cand_norm or req_norm in cand_norm or cand_norm in req_norm):
+            return True
+
+        req_dims = cls._footprint_dims_mm(requested)
+        cand_dims = cls._footprint_dims_mm(candidate)
+        if req_dims and cand_dims:
+            delta = abs(req_dims[0] - cand_dims[0]) + abs(req_dims[1] - cand_dims[1])
+            if delta <= 0.6:
+                return True
+        return False
+
+    @classmethod
+    def _is_package_equivalent_passive_alias(cls, requested: str, candidate: str, score: Optional[int] = None) -> bool:
+        alias_score = int(score if score is not None else cls._score_local_footprint_alias(requested, candidate))
+        if alias_score < 16:
+            return False
+        if not cls._is_passive_footprint_library(requested) or not cls._is_passive_footprint_library(candidate):
+            return False
+
+        req_tokens = cls._footprint_anchor_tokens(requested)
+        cand_tokens = cls._footprint_anchor_tokens(candidate)
+        if not req_tokens or not cand_tokens:
+            return False
+
+        req_numeric = {tok for tok in req_tokens if any(ch.isdigit() for ch in tok)}
+        cand_numeric = {tok for tok in cand_tokens if any(ch.isdigit() for ch in tok)}
+        shared_numeric = req_numeric & cand_numeric
+        if len(shared_numeric) >= 2:
+            return True
+
+        req_dims = cls._footprint_dims_mm(requested)
+        cand_dims = cls._footprint_dims_mm(candidate)
+        if req_dims and cand_dims and shared_numeric:
+            delta = abs(req_dims[0] - cand_dims[0]) + abs(req_dims[1] - cand_dims[1])
+            if delta <= 0.6:
+                return True
+
+        return False
+
+    @classmethod
+    def assess_footprint_id_compatibility(cls, requested: str, candidate: str) -> FootprintCompatibility:
+        req = str(requested or "").strip()
+        cand = str(candidate or "").strip()
+        if not req or not cand:
+            return FootprintCompatibility(req, cand, False, "missing", 0, "missing requested or candidate footprint")
+
+        if cls._footprint_ids_match(req, cand):
+            return FootprintCompatibility(req, cand, True, "exact", 1000, "exact footprint id match")
+
+        if cls._is_package_hint_compatible(req, cand):
+            return FootprintCompatibility(req, cand, True, "package", 64, "compatible package hint")
+
+        alias_score = cls._score_local_footprint_alias(req, cand)
+        if cls._is_package_equivalent_passive_alias(req, cand, alias_score):
+            return FootprintCompatibility(req, cand, True, "passive-package", max(alias_score, 24), "compatible passive package alias")
+
+        if cls._is_resonator_family_alias(req, cand):
+            return FootprintCompatibility(req, cand, True, "resonator-family", max(alias_score, 24), "compatible Murata CST resonator family")
+
+        if cls._has_footprint_family_conflict(req, cand):
+            return FootprintCompatibility(req, cand, False, "family-conflict", alias_score, "conflicting footprint family or library domain")
+
+        if cls._is_connector_family_alias(req, cand):
+            return FootprintCompatibility(req, cand, True, "connector-family", max(alias_score, 20), "same connector library, orientation, and normalized family shape")
+
+        req_tokens = set(cls._footprint_anchor_tokens(req))
+        cand_tokens = set(cls._footprint_anchor_tokens(cand))
+        if len(req_tokens & cand_tokens) >= 2 and alias_score >= 20:
+            return FootprintCompatibility(req, cand, True, "alias", max(alias_score, 20), "deterministic alias match")
+
+        return FootprintCompatibility(req, cand, False, "incompatible", alias_score, "no compatible footprint match")
+
+    @classmethod
+    def assess_footprint_path_compatibility(cls, fp_path: str, footprint_hint: str) -> FootprintCompatibility:
+        hint = str(footprint_hint or "").strip()
+        path = str(fp_path or "").strip()
+        if not hint or not path:
+            return FootprintCompatibility(hint, "", False, "missing", 0, "missing footprint hint or path")
+        fp_id = cls._footprint_id_from_path(path)
+        if not fp_id:
+            return FootprintCompatibility(hint, "", False, "missing", 0, "could not derive footprint id from path")
+        return cls.assess_footprint_id_compatibility(hint, fp_id)
+
+    @staticmethod
+    def _footprint_dims_mm(value: str) -> Optional[Tuple[float, float]]:
+        raw = str(value or "")
+        if ":" in raw:
+            raw = raw.split(":", 1)[1]
+        m = re.search(r"(\d+(?:\.\d+)?)x(\d+(?:\.\d+)?)mm", raw, flags=re.IGNORECASE)
+        if not m:
+            return None
+        try:
+            return float(m.group(1)), float(m.group(2))
+        except Exception:
+            return None
+
+    @classmethod
+    def _score_local_footprint_alias(cls, requested: str, candidate: str) -> int:
+        if cls._footprint_ids_match(requested, candidate):
+            return 1000
+
+        req_tokens = cls._footprint_anchor_tokens(requested)
+        cand_tokens = cls._footprint_anchor_tokens(candidate)
+        if not req_tokens or not cand_tokens:
+            return 0
+
+        req_set = set(req_tokens)
+        cand_set = set(cand_tokens)
+        shared = req_set & cand_set
+        if not shared:
+            return 0
+
+        score = sum(8 if (len(tok) >= 6 or any(ch.isdigit() for ch in tok)) else 4 for tok in shared)
+
+        # Penalize non-standard mismatch logic
+        cand_lower = candidate.lower()
+        req_lower = requested.lower()
+        for bad_tok in ["vertical", "mini", "micro", "nano", "smd", "tht"]:
+            if bad_tok in cand_lower and bad_tok not in req_lower:
+                score -= 100
+                
+        req_dims = cls._footprint_dims_mm(requested)
+        cand_dims = cls._footprint_dims_mm(candidate)
+        if req_dims and cand_dims:
+            delta = abs(req_dims[0] - cand_dims[0]) + abs(req_dims[1] - cand_dims[1])
+            if delta <= 0.25:
+                score += 12
+            elif delta <= 0.6:
+                score += 8
+            elif delta <= 1.2:
+                score += 4
+            else:
+                score -= 6
+
+        if req_tokens and cand_tokens and req_tokens[0] == cand_tokens[0]:
+            score += 4
+
+        # Same-library bonus: footprints that live in the same KiCad library are
+        # far more likely to be compatible variants than cross-library matches.
+        # This lifts candidates like Button_Switch_SMD:SW_Push_1P1T_NO_CK_KMR2
+        # above the alias-score threshold when the requested footprint is e.g.
+        # Button_Switch_SMD:SW_Push_1P1T_NO_6x6mm_H9.5mm.
+        req_lib = requested.split(":", 1)[0].strip() if ":" in requested else ""
+        cand_lib = candidate.split(":", 1)[0].strip() if ":" in candidate else ""
+        if req_lib and cand_lib and req_lib.lower() == cand_lib.lower():
+            score += 8
+
+        return score
+
+    @classmethod
+    def _footprint_id_variants(cls, value: str) -> List[str]:
+        raw = str(value or "").strip()
+        if not raw:
+            return []
+        out: List[str] = []
+        n0 = cls._norm_footprint_id(raw)
+        if n0:
+            out.append(n0)
+        if ":" in raw:
+            tail = raw.split(":", 1)[1].strip()
+            nt = cls._norm_footprint_id(tail)
+            if nt and nt not in out:
+                out.append(nt)
+        return out
+
+    @classmethod
+    def _footprint_ids_match(cls, a: str, b: str) -> bool:
+        av = cls._footprint_id_variants(a)
+        bv = cls._footprint_id_variants(b)
+        if not av or not bv:
+            return False
+        for x in av:
+            for y in bv:
+                if x == y:
+                    return True
+                if len(x) >= 10 and len(y) >= 10 and (x in y or y in x):
+                    return True
+        return False
+
+    @staticmethod
+    def _footprint_id_from_path(fp_path: str) -> str:
+        try:
+            path = Path(str(fp_path))
+            lib = path.parent.stem
+            name = path.stem
+            if lib.endswith(".pretty"):
+                lib = lib[:-7]
+            if lib and name:
+                return f"{lib}:{name}"
+        except Exception:
+            pass
+        return ""
+
+    @classmethod
+    def _score_exact_footprint_candidate(cls, requested_lib: str, candidate_lib: str) -> int:
+        req = str(requested_lib or "").strip()
+        cand = str(candidate_lib or "").strip()
+        if not req or not cand:
+            return 0
+        req_norm = cls._norm_footprint_id(req)
+        cand_norm = cls._norm_footprint_id(cand)
+        if not req_norm or not cand_norm:
+            return 0
+        if req_norm == cand_norm:
+            return 100
+        if req_norm in cand_norm or cand_norm in req_norm:
+            return 80
+        req_head = req_norm.split("pretty", 1)[0]
+        cand_head = cand_norm.split("pretty", 1)[0]
+        if req_head and cand_head and (req_head in cand_head or cand_head in req_head):
+            return 60
+        req_prefix = req.split("_", 1)[0].lower()
+        cand_prefix = cand.split("_", 1)[0].lower()
+        if req_prefix and cand_prefix and req_prefix == cand_prefix:
+            return 20
+        return 0
+
+    def _log_footprint_resolution_diagnostics(self, hint: str, ranked_candidates: List[Tuple[int, str]]) -> None:
+        if not ranked_candidates:
+            logger.warning("Footprint resolution failed for %s with no viable local candidates", hint)
+            return
+        rows: List[str] = []
+        for score, fp_id in ranked_candidates[:5]:
+            compatibility = self.assess_footprint_id_compatibility(hint, fp_id)
+            rows.append(
+                f"{fp_id} score={score} matched={compatibility.matched} kind={compatibility.match_kind} reason={compatibility.reason}"
+            )
+        logger.warning(
+            "Footprint resolution failed for %s. Top local candidates: %s",
+            hint,
+            " | ".join(rows),
+        )
+
+    def _log_ambiguous_footprint_candidates(self, hint: str, candidates: List[Tuple[int, str, str]]) -> None:
+        rows: List[str] = []
+        for score, fp_id, _path in candidates[:5]:
+            compatibility = self.assess_footprint_id_compatibility(hint, fp_id)
+            rows.append(
+                f"{fp_id} score={score} kind={compatibility.match_kind} reason={compatibility.reason}"
+            )
+        logger.warning(
+            "Footprint resolution for %s is ambiguous after compatibility filtering: %s",
+            hint,
+            " | ".join(rows),
+        )
+
+    def _resolve_exact_local_footprint_path(self, footprint_hint: str) -> Optional[str]:
+        hint = str(footprint_hint or "").strip()
+        if not hint or ":" not in hint:
+            return None
+        lib, name = hint.split(":", 1)
+        exact = self._find_local_footprint_path(lib.strip(), name.strip())
+        if exact:
+            return exact
+        exact = self._find_local_footprint_path_ci(lib.strip(), name.strip())
+        if exact:
+            return exact
+
+        # Some KiCad libs moved names between releases while keeping the same
+        # footprint tail. If the footprint name matches exactly on disk, prefer
+        # the closest library match instead of falling back to fuzzy search.
+        candidates = self._find_local_footprint_paths_by_name_ci(name.strip())
+        if candidates:
+            if len(candidates) == 1:
+                return candidates[0][2]
+
+            best_path: Optional[str] = None
+            best_score = -1
+            for cand_lib, _cand_name, cand_path in candidates:
+                score = self._score_exact_footprint_candidate(lib.strip(), cand_lib)
+                if score > best_score:
+                    best_score = score
+                    best_path = cand_path
+            if best_score > 0:
+                return best_path
+
+        try:
+            index = self._build_local_index()
+        except Exception:
+            return None
+
+        alias_ranked: List[Tuple[int, str, str]] = []
+        scored_candidates: List[Tuple[int, str]] = []
+        rejected_aliases: List[Tuple[int, str, str]] = []
+        for _display, fp_name, fp_lib, etype, file_path in index:
+            if etype != "footprint" or not file_path:
+                continue
+            fp_id = f"{fp_lib}:{fp_name}"
+            compatibility = self.assess_footprint_id_compatibility(hint, fp_id)
+            score = int(compatibility.score)
+            if compatibility.matched:
+                alias_ranked.append((score, fp_id, str(file_path)))
+            elif score >= 20:
+                rejected_aliases.append((score, fp_id, compatibility.reason))
+            if score > 0:
+                scored_candidates.append((score, fp_id))
+
+        alias_ranked.sort(key=lambda item: (-item[0], item[1]))
+        scored_candidates.sort(key=lambda item: (-item[0], item[1]))
+        if alias_ranked:
+            alias_ranked = self._dedupe_alias_candidates(hint, alias_ranked)
+            exact_matches = [row for row in alias_ranked if self.assess_footprint_id_compatibility(hint, row[1]).match_kind == "exact"]
+            if len(exact_matches) == 1:
+                _score, fp_id, fp_path = exact_matches[0]
+                logger.info(
+                    "Unique exact-compatible local footprint selected for %s -> %s",
+                    hint,
+                    fp_id,
+                )
+                return fp_path
+            if len(alias_ranked) >= 2:
+                top_pref = self._candidate_preference_tuple(hint, alias_ranked[0])
+                next_pref = self._candidate_preference_tuple(hint, alias_ranked[1])
+                top_compat = self.assess_footprint_id_compatibility(hint, alias_ranked[0][1])
+                next_compat = self.assess_footprint_id_compatibility(hint, alias_ranked[1][1])
+                safe_dominant = (
+                    top_compat.match_kind in {"exact", "package", "passive-package", "resonator-family"}
+                    or int(top_compat.score) - int(next_compat.score) >= 8
+                )
+                if top_pref > next_pref and safe_dominant:
+                    _score, fp_id, fp_path = alias_ranked[0]
+                    logger.info(
+                        "Dominant compatible local footprint selected for %s -> %s (%s)",
+                        hint,
+                        fp_id,
+                        top_compat.match_kind,
+                    )
+                    return fp_path
+            shortlist = alias_ranked[:5]
+            if len(shortlist) == 1:
+                score, fp_id, fp_path = shortlist[0]
+                compatibility = self.assess_footprint_id_compatibility(hint, fp_id)
+                logger.info(
+                    "Unique compatible local footprint selected for %s -> %s (%s)",
+                    hint,
+                    fp_id,
+                    compatibility.match_kind,
+                )
+                return fp_path
+            chosen = self._rank_local_alias_candidates_with_llm(hint, shortlist)
+            if chosen:
+                logger.info("LLM alias ranking selected local footprint for %s -> %s", hint, chosen)
+                return chosen
+            # LLM unavailable or returned no confident match.  When every
+            # shortlist candidate lives in the same library as the request it is
+            # safe to pick the top-ranked one – they are all valid variants of
+            # the same footprint family (e.g. Button_Switch_SMD:SW_Push_*).
+            hint_lib = hint.split(":", 1)[0].strip().lower() if ":" in hint else ""
+            if hint_lib and all(
+                fp_id.split(":", 1)[0].strip().lower() == hint_lib
+                for _, fp_id, _ in shortlist
+            ):
+                _top_score, top_fp_id, top_fp_path = shortlist[0]
+                logger.info(
+                    "Same-library fallback selected local footprint for %s -> %s (LLM unavailable)",
+                    hint,
+                    top_fp_id,
+                )
+                return top_fp_path
+            # Passive-package tie-break: when all shortlist candidates share
+            # the same passive-package match_kind and same score (e.g. Varistor_SMD
+            # which has no KiCad entry), prefer Resistor_SMD over other equivalents
+            # since passive varistors share the same land pattern.
+            try:
+                top_score = shortlist[0][0]
+                all_passive_package = all(
+                    sc == top_score
+                    and self.assess_footprint_id_compatibility(hint, fp_id).match_kind == "passive-package"
+                    for sc, fp_id, _ in shortlist
+                )
+                if all_passive_package:
+                    preferred = next(
+                        (t for t in shortlist if t[1].startswith("Resistor_SMD:")),
+                        shortlist[0],
+                    )
+                    logger.warning(
+                        "Passive-package fallback selected for %s -> %s (no exact library match)",
+                        hint,
+                        preferred[1],
+                    )
+                    return preferred[2]
+            except Exception:
+                pass
+            self._log_ambiguous_footprint_candidates(hint, shortlist)
+        if rejected_aliases:
+            rejected_aliases.sort(key=lambda item: (-item[0], item[1]))
+            rows = [f"{fp_id} score={score} reason={reason}" for score, fp_id, reason in rejected_aliases[:5]]
+            logger.info(
+                "Rejected incompatible high-score footprint aliases for %s: %s",
+                hint,
+                " | ".join(rows),
+            )
+        self._log_footprint_resolution_diagnostics(hint, scored_candidates)
+        return None
+
+    def footprint_path_matches_hint(self, fp_path: str, footprint_hint: str) -> bool:
+        return self.assess_footprint_path_compatibility(fp_path, footprint_hint).matched
 
     def _suggest_generic_footprints_for_kind(self, kind: str, limit: int = 20) -> List[LibraryItem]:
         """Return a small set of generic footprints for common value-only queries.
@@ -503,12 +1485,18 @@ class LibraryManager:
                 results = self._search_kicad_builtin_sync(query, limit)
             return results
         if source == LibrarySource.SNAPEDA:
+            if not self.enable_snapeda_sources:
+                logger.info("SnapEDA search disabled by config.")
+                return []
             return self._search_snapeda_sync(query, limit)
         if source == LibrarySource.GITHUB_CURATED:
             return self._search_github_curated_local(query, limit)
         if source == LibrarySource.GITHUB_SEARCH:
             return self._search_github_search_sync(query, limit)
         if source == LibrarySource.EASYEDA:
+            if not self.enable_easyeda_sources:
+                logger.info("EasyEDA search disabled by config.")
+                return []
             return self._search_easyeda_sync(query, limit)
         logger.warning(f"Search not implemented for source: {source}")
         return []
@@ -561,7 +1549,8 @@ class LibraryManager:
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
             
-            with urlopen(req, timeout=15, context=ctx) as resp:
+            # Keep timeout short: this is a fallback path and shouldn't stall UI/tests.
+            with urlopen(req, timeout=6, context=ctx) as resp:
                 data = json.loads(resp.read().decode('utf-8'))
         except Exception as e:
             logger.warning("EasyEDA search failed for %r: %s", q, e)
@@ -934,6 +1923,13 @@ class LibraryManager:
 
         This is intentionally conservative: it is rate-limited without a token.
         """
+        if not self.github_token:
+            if not self._warned_no_github_token:
+                logger.info(
+                    "GitHub search disabled (no token). Set GITHUB_TOKEN (or GH_TOKEN) to enable."
+                )
+                self._warned_no_github_token = True
+            return []
         # Avoid excessive network calls for very short/ambiguous queries.
         q = (query or '').strip()
         if len(q) < 4:
@@ -1003,10 +1999,7 @@ class LibraryManager:
                 'Accept': 'application/vnd.github+json',
                 'User-Agent': 'VibeCAD/0.4.0',
             }
-            # Optional token (not required); only helps rate limits.
-            tok = os.environ.get('GITHUB_TOKEN', '').strip()
-            if tok:
-                headers['Authorization'] = f"Bearer {tok}"
+            headers['Authorization'] = f"Bearer {self.github_token}"
             req = Request(url, headers=headers)
             try:
                 if verified_ctx is None:
@@ -1144,7 +2137,27 @@ class LibraryManager:
         q = re.sub(r'(\d+)\s*(ohm)\b', r'\1ohm', q)
         q = re.sub(r'(\d+)\s*([kmr])\b', r'\1\2', q)
 
-        tokens = re.split(r'[\s,_\-/]+', q)
+        # Tokenize while preserving "glued" one-character suffixes when the
+        # original query used a non-whitespace separator (e.g. "USB_B" → "usb","b",
+        # "USB-C" → "usb","c", "SOT-223-3" → "sot","223","3"). This avoids losing
+        # meaningful disambiguators that are common in library identifiers.
+        glue_chars = {"_", "-", ":", "/", "+", "."}
+        raw_tokens: List[Tuple[str, bool]] = []  # (token, glued_to_previous)
+        last_sep = ""
+        for m in re.finditer(r"[a-z0-9]+|[^a-z0-9]+", q):
+            chunk = m.group(0)
+            if not chunk:
+                continue
+            if re.fullmatch(r"[a-z0-9]+", chunk):
+                glued = False
+                if raw_tokens and last_sep:
+                    has_space = any(ch.isspace() for ch in last_sep)
+                    has_glue = any(ch in glue_chars for ch in last_sep)
+                    glued = (not has_space) and has_glue
+                raw_tokens.append((chunk, glued))
+                last_sep = ""
+            else:
+                last_sep = chunk
         stopwords = {
             'a', 'an', 'the',
             'add', 'place', 'insert', 'put', 'drop', 'create',
@@ -1152,6 +2165,14 @@ class LibraryManager:
             'to', 'on', 'onto', 'into', 'in', 'at',
             'part', 'parts', 'component', 'components',
             'symbol', 'footprint', 'package',
+            # Generic placement / mechanical qualifiers that cause pathological
+            # ranking (e.g. "USB-B connector through hole" matching Micro-B
+            # "CircularHoles" footprints above true USB-B).
+            'through', 'hole', 'holes',
+            'female', 'male',
+            'vertical', 'horizontal',
+            'mount', 'mounting',
+            'type',
             'kicad', 'library', 'lib',
             'pcb', 'board', 'schematic',
             'mpn', 'pn', 'p/n',
@@ -1165,10 +2186,13 @@ class LibraryManager:
             'an', 'mn', 'sn', 'ss',
         }
         out: List[str] = []
-        for t in tokens:
-            # Strip leading/trailing punctuation so queries like "ads1256." work.
-            t = re.sub(r'^[^a-z0-9]+|[^a-z0-9]+$', '', t)
+        for t, glued in raw_tokens:
+            # Keep glued one-character tokens (e.g. USB_B's "b") even if they
+            # would otherwise be dropped, and do not apply stopword filters to
+            # these suffix tokens.
             if len(t) < 2:
+                if glued and (t.isalpha() or t.isdigit()):
+                    out.append(t)
                 continue
             if t in stopwords:
                 continue
@@ -1190,6 +2214,21 @@ class LibraryManager:
         pkg = (package_hint or '').strip().upper() or self._extract_package_hint(q)
         preferred_libs = self._preferred_footprint_libs_for_package(pkg) if pkg else []
         pkg_token = pkg.lower() if pkg else ''
+        exact_fp_path = self._resolve_exact_local_footprint_path(pkg) if pkg else None
+        if exact_fp_path:
+            lib, name = pkg.split(":", 1)
+            item = LibraryItem(
+                name=pkg,
+                manufacturer="(KiCad local)",
+                mpn=name.strip() or q,
+                description=f"Exact footprint hint {pkg}",
+                source=LibrarySource.KICAD_BUILTIN,
+                category=lib.strip(),
+                package=pkg,
+            )
+            item.local_footprint_path = exact_fp_path
+            return item
+        explicit_footprint_id = bool(pkg and ":" in pkg)
 
         try:
             candidates = self.search_parts_sync(q, source=None, limit=50)
@@ -1216,6 +2255,9 @@ class LibraryManager:
             fp_url = getattr(item, 'footprint_url', None)
             if not fp_path and not fp_url:
                 continue
+            if explicit_footprint_id:
+                if not fp_path or not self.footprint_path_matches_hint(str(fp_path), pkg):
+                    continue
 
             rank = 0
             name = (getattr(item, 'name', '') or '')
@@ -1358,7 +2400,7 @@ class LibraryManager:
             return ['Package_QFP']
         if fam in {'QFN', 'UQFN', 'VQFN', 'WQFN', 'DFN', 'LFCSP'}:
             return ['Package_DFN_QFN']
-        if fam in {'SOIC', 'SOP', 'SO', 'SSOP', 'LSSOP', 'TSSOP', 'HTSSOP', 'MSOP'}:
+        if fam in {'SOIC', 'SOP', 'SO', 'SSOP', 'LSSOP', 'VSSOP', 'TSSOP', 'HTSSOP', 'MSOP'}:
             return ['Package_SO']
         if fam in {'SOT'}:
             return ['Package_TO_SOT_SMD', 'Package_TO_SOT_THT']
@@ -1400,6 +2442,11 @@ class LibraryManager:
         preferred_libs = self._preferred_footprint_libs_for_package(pkg) if pkg else []
         pkg_token = pkg.lower() if pkg else ''
         expected_pins = _extract_expected_pin_count(q, pkg)
+        exact_fp_path = self._resolve_exact_local_footprint_path(pkg) if pkg else None
+        if exact_fp_path:
+            resolved_name = pkg.split(":", 1)[1].strip() if ":" in pkg else q
+            return (resolved_name or q, exact_fp_path)
+        explicit_footprint_id = bool(pkg and ":" in pkg)
 
         def _candidates(search_q: str) -> List[LibraryItem]:
             try:
@@ -1425,6 +2472,8 @@ class LibraryManager:
                 fp_path = getattr(item, 'local_footprint_path', None)
                 if not fp_path:
                     symbol_only_items.append(item)
+                    continue
+                if explicit_footprint_id and not self.footprint_path_matches_hint(str(fp_path), pkg):
                     continue
 
                 # Rank package-specific matches higher.
@@ -1507,6 +2556,8 @@ class LibraryManager:
                     fp_path = getattr(item, 'local_footprint_path', None)
                     if not fp_path:
                         continue
+                    if explicit_footprint_id and not self.footprint_path_matches_hint(str(fp_path), pkg):
+                        continue
                     rank = 0
                     name = (getattr(item, 'name', '') or '')
                     lib = (getattr(item, 'category', '') or '')
@@ -1562,6 +2613,15 @@ class LibraryManager:
                 score += 1.0
             elif t in name_lower:
                 score += 0.3  # Substring-only match is much weaker
+        
+        # Penalize non-standard orientations/types if not explicitly requested
+        if 'vertical' not in tokens and 'vertical' in name_lower:
+            score -= 10.0
+        if 'mini' not in tokens and 'mini' in name_lower:
+            score -= 10.0
+        if 'micro' not in tokens and 'micro' in name_lower:
+            score -= 10.0
+            
         return score / len(tokens)
 
     # ------------------------------------------------------------------
@@ -1990,6 +3050,13 @@ class LibraryManager:
     
     def _search_snapeda_sync(self, query: str, limit: int) -> List[LibraryItem]:
         """Search SnapEDA for parts (synchronous)."""
+        if not self.snapeda_api_key:
+            if not self._warned_no_snapeda_key:
+                logger.info(
+                    "SnapEDA search disabled (no API key). Set SNAPEDA_API_KEY to enable."
+                )
+                self._warned_no_snapeda_key = True
+            return []
         try:
             url = f"{self.SNAPEDA_SEARCH_URL}?q={quote_plus(query)}&limit={limit}"
             
@@ -2061,17 +3128,9 @@ class LibraryManager:
                 else:
                     raise
 
-            # SnapEDA returns {"error": "not logged in"} without auth
             if data.get('error'):
                 err_msg = data['error']
-                if 'not logged in' in err_msg.lower() or 'auth' in err_msg.lower():
-                    logger.warning(
-                        "SnapEDA API requires authentication. "
-                        "Set SNAPEDA_API_KEY env var or request an API key "
-                        "at https://www.snapeda.com/get-api/"
-                    )
-                else:
-                    logger.warning("SnapEDA API error: %s", err_msg)
+                logger.warning("SnapEDA API error: %s", err_msg)
                 return []
             
             results = []
@@ -2204,38 +3263,95 @@ class LibraryManager:
         """Download a file from URL."""
         try:
             headers = {'User-Agent': 'VibeCAD/0.4.0'}
-            
+
             if self.snapeda_api_key and 'snapeda.com' in url:
                 headers['Authorization'] = f'Token {self.snapeda_api_key}'
-            
+
             request = Request(url, headers=headers)
-            
+
             dest_path = os.path.join(dest_dir, filename)
-            
-            with urlopen(request, timeout=30) as response:
-                content = response.read()
-                
-                # Check if it's a zip file
-                if content[:4] == b'PK\x03\x04':
-                    zip_path = dest_path + '.zip'
-                    with open(zip_path, 'wb') as f:
-                        f.write(content)
-                    
-                    # Extract the zip
-                    with zipfile.ZipFile(zip_path, 'r') as zf:
-                        zf.extractall(dest_dir)
-                    
-                    # Find the extracted file
-                    for f in os.listdir(dest_dir):
-                        if f.endswith(('.kicad_sym', '.kicad_mod', '.lib', '.pretty')):
-                            return os.path.join(dest_dir, f)
+
+            # Build SSL contexts (same pattern as other fetch methods).
+            cafile = (
+                os.environ.get("VIBECAD_CA_BUNDLE", "").strip()
+                or os.environ.get("REQUESTS_CA_BUNDLE", "").strip()
+                or os.environ.get("SSL_CERT_FILE", "").strip()
+            )
+            if not cafile:
+                try:
+                    import certifi  # type: ignore
+                    cafile = certifi.where() or ""
+                except Exception:
+                    cafile = ""
+            verified_ctx: Optional[ssl.SSLContext]
+            try:
+                verified_ctx = ssl.create_default_context(cafile=cafile) if cafile else ssl.create_default_context()
+            except Exception:
+                verified_ctx = None
+            try:
+                unverified_ctx: Optional[ssl.SSLContext] = ssl._create_unverified_context()
+            except Exception:
+                unverified_ctx = None
+            allow_insecure = bool(os.environ.get("VIBECAD_SSL_NO_VERIFY", "").strip())
+
+            def _looks_like_cert_error(exc: Exception) -> bool:
+                try:
+                    if isinstance(exc, ssl.SSLCertVerificationError):
+                        return True
+                except Exception:
+                    pass
+                try:
+                    reason = getattr(exc, 'reason', None)
+                    if reason is not None:
+                        if isinstance(reason, ssl.SSLCertVerificationError):
+                            return True
+                        if isinstance(reason, ssl.SSLError) and 'CERTIFICATE_VERIFY_FAILED' in str(reason):
+                            return True
+                except Exception:
+                    pass
+                return 'CERTIFICATE_VERIFY_FAILED' in str(exc)
+
+            def _do_fetch(ctx: Optional[ssl.SSLContext]) -> bytes:
+                if ctx is None:
+                    with urlopen(request, timeout=30) as resp:
+                        return resp.read()
+                with urlopen(request, timeout=30, context=ctx) as resp:
+                    return resp.read()
+
+            try:
+                content = _do_fetch(verified_ctx)
+            except Exception as exc:
+                if allow_insecure and unverified_ctx is not None and _looks_like_cert_error(exc):
+                    logger.warning(
+                        "File download used unverified SSL context (cert verify failed): %s. "
+                        "Set VIBECAD_CA_BUNDLE/SSL_CERT_FILE or install certifi to avoid this.",
+                        exc,
+                    )
+                    content = _do_fetch(unverified_ctx)
                 else:
-                    with open(dest_path, 'wb') as f:
-                        f.write(content)
-                    return dest_path
-            
+                    raise
+
+            # Check if it's a zip file
+            if content[:4] == b'PK\x03\x04':
+                zip_path = dest_path + '.zip'
+                with open(zip_path, 'wb') as f:
+                    f.write(content)
+
+                # Extract the zip
+                with zipfile.ZipFile(zip_path, 'r') as zf:
+                    zf.extractall(dest_dir)
+
+                # Find the extracted file
+                for f in os.listdir(dest_dir):
+                    if f.endswith(('.kicad_sym', '.kicad_mod', '.lib', '.pretty')):
+                        return os.path.join(dest_dir, f)
+            else:
+                with open(dest_path, 'wb') as f:
+                    f.write(content)
+                return dest_path
+
             return None
-            
+
         except Exception as e:
             logger.exception(f"File download failed: {e}")
             return None
@@ -2249,6 +3365,12 @@ class LibraryManager:
             dest_path = os.path.join(symbols_dir, f"VibeCAD_{name}.kicad_sym")
             
             import shutil
+            try:
+                if os.path.abspath(source_path) == os.path.abspath(dest_path):
+                    logger.info(f"Symbol already installed at {dest_path}")
+                    return dest_path
+            except Exception:
+                pass
             shutil.copy2(source_path, dest_path)
             
             logger.info(f"Installed symbol to {dest_path}")
@@ -2267,6 +3389,12 @@ class LibraryManager:
             dest_path = os.path.join(footprints_dir, f"{name}.kicad_mod")
             
             import shutil
+            try:
+                if os.path.abspath(source_path) == os.path.abspath(dest_path):
+                    logger.info(f"Footprint already installed at {dest_path}")
+                    return dest_path
+            except Exception:
+                pass
             shutil.copy2(source_path, dest_path)
             
             logger.info(f"Installed footprint to {dest_path}")

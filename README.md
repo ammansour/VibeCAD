@@ -25,6 +25,8 @@ All LLM responses must reference specific detected facts (component refs, net na
    - **Linux**: `~/.local/share/kicad/7.0/scripting/plugins/`
    - **macOS**: `~/Library/Preferences/kicad/7.0/scripting/plugins/`
    - **Windows**: `%APPDATA%\kicad\7.0\scripting\plugins\`
+   - The folder is self-contained: `vibecad_settings.json` and bundled credentials live inside `vibecad/`, so you can zip and share that folder directly.
+   - To build that zip from this repo, run `./scripts/package_vibecad_bundle.sh` and share the resulting `dist/vibecad-shareable.zip`.
 
 2. Configure an OpenAI-compatible API key:
    ```bash

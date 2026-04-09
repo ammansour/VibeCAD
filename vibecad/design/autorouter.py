@@ -5,15 +5,18 @@ Provides:
   - DSN export from current board
   - Freerouting invocation (headless, subprocess)
   - SES import of routed results
-  - Grid-based A* fallback autorouter with obstacle avoidance
+  - Optional grid-based A* fallback autorouter with obstacle avoidance
 """
 
 import heapq
+import json
 import logging
 import os
 import shutil
 import subprocess
 import tempfile
+import time
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
@@ -33,33 +36,167 @@ class AutorouteResult:
     success: bool
     message: str
     method: str = ""        # "freerouting", "manhattan", or "direct"
+    manual_required: bool = False
+    dsn_path: str = ""
     tracks_added: int = 0
     vias_added: int = 0
     unrouted_remaining: int = 0
 
 
+def _common_freerouting_locations() -> List[Path]:
+    roots = [
+        Path.home() / ".vibecad" / "freerouting.jar",
+        Path.home() / "Library" / "Application Support" / "kicad" / "scripting" / "plugins",
+        Path.home() / ".local" / "share" / "kicad" / "scripting" / "plugins",
+        Path.home() / ".kicad_plugins",
+    ]
+    roots.extend(_kicad_third_party_roots())
+
+    deduped: List[Path] = []
+    seen: Set[str] = set()
+    for path in roots:
+        key = str(path)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(path)
+    return deduped
+
+
+def _iter_version_dirs(root: Path) -> List[Path]:
+    if not root.is_dir():
+        return []
+    try:
+        children = [child for child in root.iterdir() if child.is_dir()]
+    except Exception:
+        return []
+    return sorted(children, key=lambda path: path.name, reverse=True)
+
+
+def _kicad_third_party_roots() -> List[Path]:
+    roots: List[Path] = []
+    for base in (
+        Path.home() / "Documents" / "KiCad",
+        Path.home() / ".local" / "share" / "kicad",
+        Path(os.environ.get("DOCUMENTS", Path.home() / "Documents")) / "KiCad",
+    ):
+        for version_dir in _iter_version_dirs(base):
+            roots.append(version_dir / "3rdparty")
+            roots.append(version_dir / "3rdparty" / "plugins")
+
+    import platform
+    if platform.system() == "Windows":
+        prefs_root = Path(os.environ.get("APPDATA", "")) / "kicad"
+    else:
+        prefs_root = Path.home() / "Library" / "Preferences" / "kicad"
+        
+    for version_dir in _iter_version_dirs(prefs_root):
+        pcbnew_json = version_dir / "pcbnew.json"
+        if not pcbnew_json.is_file():
+            continue
+        try:
+            data = json.loads(pcbnew_json.read_text())
+        except Exception:
+            continue
+        for row in list(data.get("action_plugins") or []):
+            if not isinstance(row, dict):
+                continue
+            for key in row.keys():
+                raw = str(key or "")
+                if "freerouting" not in raw.lower():
+                    continue
+                plugin_path = raw.split("/plugin.py/", 1)[0].strip()
+                if plugin_path:
+                    roots.append(Path(plugin_path))
+                    roots.append(Path(plugin_path).parent)
+        roots.append(Path.home() / "Documents" / "KiCad" / version_dir.name / "3rdparty")
+        roots.append(Path.home() / "Documents" / "KiCad" / version_dir.name / "3rdparty" / "plugins")
+
+    return roots
+
+
+def _kicad_pcm_stale_hint() -> str:
+    import platform
+    if platform.system() == "Windows":
+        prefs_root = Path(os.environ.get("APPDATA", "")) / "kicad"
+    else:
+        prefs_root = Path.home() / "Library" / "Preferences" / "kicad"
+        
+    stale_paths: List[str] = []
+    if not prefs_root.is_dir():
+        return ""
+    for version_dir in _iter_version_dirs(prefs_root):
+        pcbnew_json = version_dir / "pcbnew.json"
+        if not pcbnew_json.is_file():
+            continue
+        try:
+            data = json.loads(pcbnew_json.read_text())
+        except Exception:
+            continue
+        for row in list(data.get("action_plugins") or []):
+            if not isinstance(row, dict):
+                continue
+            for key in row.keys():
+                raw = str(key or "")
+                if "freerouting" not in raw.lower():
+                    continue
+                plugin_path = raw.split("/plugin.py/", 1)[0].strip()
+                if plugin_path and (not Path(plugin_path).exists()):
+                    stale_paths.append(plugin_path)
+    if not stale_paths:
+        return ""
+    unique = sorted(set(stale_paths))
+    return (
+        "KiCad PCM metadata references Freerouting, but the plugin payload is missing at "
+        f"{unique[0]}. Reinstall the Freerouting PCM package in KiCad."
+    )
+
+
 def _find_freerouting_jar() -> Optional[str]:
-    """Locate the Freerouting JAR file.
+    """Locate a Freerouting executable or JAR.
 
     Search order:
       1. FREEROUTING_JAR environment variable
       2. ~/.vibecad/freerouting.jar
-      3. 'freerouting' or 'freerouting.jar' on PATH
+      3. common KiCad plugin directories
+      4. 'freerouting' on PATH
     """
-    # Env var
     env_jar = os.environ.get("FREEROUTING_JAR")
     if env_jar and Path(env_jar).is_file():
         return env_jar
 
-    # ~/.vibecad
-    home_jar = Path.home() / ".vibecad" / "freerouting.jar"
-    if home_jar.is_file():
-        return str(home_jar)
+    for candidate in _common_freerouting_locations():
+        if candidate.is_file():
+            return str(candidate)
+        if not candidate.is_dir():
+            continue
+        for pattern in ("*freerouting*.jar", "*Freerouting*.jar"):
+            for match in candidate.rglob(pattern):
+                if match.is_file():
+                    return str(match)
+        for pattern in ("*freerouting*.app", "*Freerouting*.app"):
+            for match in candidate.rglob(pattern):
+                launcher = match / "Contents" / "MacOS" / match.stem
+                if launcher.is_file() and os.access(launcher, os.X_OK):
+                    return str(launcher)
+        for pattern in ("*freerouting*", "*Freerouting*"):
+            for match in candidate.rglob(pattern):
+                if not match.is_file():
+                    continue
+                if match.suffix.lower() in {".py", ".json", ".md", ".txt", ".zip"}:
+                    continue
+                if os.access(match, os.X_OK):
+                    return str(match)
 
-    # Check PATH for 'freerouting' command
     fr = shutil.which("freerouting")
     if fr:
         return fr
+    
+    import platform
+    if platform.system() == "Windows":
+        fr_exe = shutil.which("freerouting.exe")
+        if fr_exe:
+            return fr_exe
 
     return None
 
@@ -75,6 +212,133 @@ def _java_available() -> bool:
         return result.returncode == 0
     except Exception:
         return False
+
+
+def _java_runtime_major_version() -> Optional[int]:
+    """Return installed Java major version (e.g. 17, 21), if detectable."""
+    try:
+        result = subprocess.run(
+            ["java", "-version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+
+    text = "\n".join(
+        [
+            str(result.stderr or "").strip(),
+            str(result.stdout or "").strip(),
+        ]
+    )
+    if not text.strip():
+        return None
+
+    import re
+
+    token = ""
+    m = re.search(r'version\s+"([^"]+)"', text)
+    if m:
+        token = str(m.group(1) or "").strip()
+    if not token:
+        m = re.search(r"\b(\d+(?:\.\d+){0,2})\b", text)
+        if m:
+            token = str(m.group(1) or "").strip()
+    if not token:
+        return None
+
+    if token.startswith("1."):
+        parts = token.split(".")
+        if len(parts) >= 2 and parts[1].isdigit():
+            return int(parts[1])
+    first = token.split(".", 1)[0].strip()
+    if first.isdigit():
+        return int(first)
+    return None
+
+
+def _class_major_to_java_major(class_major: int) -> Optional[int]:
+    if class_major < 45:
+        return None
+    return int(class_major - 44)
+
+
+def _class_major_from_bytes(blob: bytes) -> Optional[int]:
+    if not isinstance(blob, (bytes, bytearray)) or len(blob) < 8:
+        return None
+    if blob[0:4] != b"\xca\xfe\xba\xbe":
+        return None
+    try:
+        return int.from_bytes(blob[6:8], "big")
+    except Exception:
+        return None
+
+
+def _jar_required_java_major(jar_path: str) -> Optional[int]:
+    """Estimate minimum Java major required by a jar's class files."""
+    try:
+        with zipfile.ZipFile(jar_path, "r") as zf:
+            names = list(zf.namelist())
+            if not names:
+                return None
+
+            candidates: List[str] = []
+            try:
+                manifest = zf.read("META-INF/MANIFEST.MF").decode("utf-8", errors="ignore")
+            except Exception:
+                manifest = ""
+            if manifest:
+                import re
+
+                m = re.search(r"(?mi)^Main-Class:\s*([^\r\n]+)\s*$", manifest)
+                if m:
+                    main_class = str(m.group(1) or "").strip()
+                    if main_class:
+                        candidates.append(main_class.replace(".", "/") + ".class")
+
+            if not candidates:
+                candidates = [
+                    name
+                    for name in names
+                    if name.endswith(".class") and (not name.startswith("META-INF/versions/"))
+                ]
+            if not candidates:
+                candidates = [name for name in names if name.endswith(".class")]
+            if not candidates:
+                return None
+
+            max_major = 0
+            for name in candidates:
+                try:
+                    major = _class_major_from_bytes(zf.read(name)[:8])
+                except Exception:
+                    major = None
+                if major is None:
+                    continue
+                max_major = max(max_major, int(major))
+            if max_major <= 0:
+                return None
+            return _class_major_to_java_major(max_major)
+    except Exception:
+        return None
+
+
+def _freerouting_java_compatibility_issue(jar_path: str) -> str:
+    runtime_major = _java_runtime_major_version()
+    if runtime_major is None:
+        return "Java runtime version could not be detected. Install Java to use Freerouting."
+    required_major = _jar_required_java_major(jar_path)
+    if required_major is None:
+        return ""
+    if runtime_major < required_major:
+        return (
+            f"Installed Java runtime is {runtime_major}, but Freerouting requires Java {required_major}+ "
+            f"for {Path(jar_path).name}."
+        )
+    return ""
 
 
 def export_dsn(board_path: str, output_path: Optional[str] = None) -> Tuple[bool, str]:
@@ -152,11 +416,23 @@ def run_freerouting(dsn_path: str, timeout_seconds: int = 300) -> Tuple[bool, st
         return False, "Freerouting not found. Install it at ~/.vibecad/freerouting.jar or set FREEROUTING_JAR."
 
     ses_path = str(Path(dsn_path).with_suffix(".ses"))
+    ses_file = Path(ses_path)
+
+    # Prevent stale session files from prior runs from being mistaken as new output.
+    try:
+        ses_file.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    launch_time = time.time()
 
     # Determine if it's a JAR or executable
     if jar.endswith(".jar"):
         if not _java_available():
             return False, "Java runtime not found. Install Java to use Freerouting."
+        compat_issue = _freerouting_java_compatibility_issue(jar)
+        if compat_issue:
+            return False, compat_issue
         cmd = ["java", "-jar", jar, "-de", dsn_path, "-do", ses_path, "-mp", "20"]
     else:
         cmd = [jar, "-de", dsn_path, "-do", ses_path, "-mp", "20"]
@@ -169,7 +445,7 @@ def run_freerouting(dsn_path: str, timeout_seconds: int = 300) -> Tuple[bool, st
             timeout=timeout_seconds,
         )
 
-        if Path(ses_path).exists():
+        if ses_file.exists() and ses_file.stat().st_size > 0:
             return True, ses_path
         elif result.returncode == 0:
             return False, f"Freerouting completed but no SES file produced. stdout: {result.stdout[:500]}"
@@ -177,69 +453,174 @@ def run_freerouting(dsn_path: str, timeout_seconds: int = 300) -> Tuple[bool, st
             return False, f"Freerouting failed (rc={result.returncode}): {result.stderr[:500]}"
 
     except subprocess.TimeoutExpired:
+        # Some Freerouting builds can emit SES and then linger waiting for UI
+        # shutdown; treat a fresh, non-empty SES as a successful route.
+        try:
+            if ses_file.exists() and ses_file.stat().st_size > 0 and ses_file.stat().st_mtime >= (launch_time - 1.0):
+                return True, ses_path
+        except Exception:
+            pass
         return False, f"Freerouting timed out after {timeout_seconds}s"
     except Exception as e:
         return False, f"Freerouting execution failed: {e}"
 
 
-def autoroute(board_path: str, timeout_seconds: int = 300) -> AutorouteResult:
-    """Full autoroute pipeline: export DSN → run Freerouting → import SES.
+def _manual_freerouting_message(reason: str, board_path: str, dsn_path: str) -> str:
+    board_name = Path(board_path).name or board_path
+    return (
+        f"{reason}\n"
+        f"Manual Freerouting handoff:\n"
+        f"1. Open or keep the board loaded in KiCad: {board_name}\n"
+        f"2. Use the exported DSN file: {dsn_path}\n"
+        f"3. Run Freerouting manually on that DSN and generate a routed .ses session file.\n"
+        f"4. Import the resulting .ses back into KiCad for the same board.\n"
+        "To enable automatic Freerouting in VibeCAD later, set FREEROUTING_JAR, "
+        "place the jar at ~/.vibecad/freerouting.jar, or install a `freerouting` executable on PATH."
+    )
 
-    Falls back to manhattan routing if Freerouting is unavailable.
+
+def autoroute(
+    board_path: str,
+    timeout_seconds: int = 300,
+    allow_manhattan_fallback: bool = False,
+) -> AutorouteResult:
+    """Full autoroute pipeline: export DSN → run Freerouting → import SES.
 
     Args:
         board_path: Path to the .kicad_pcb file.
         timeout_seconds: Max time for Freerouting.
+        allow_manhattan_fallback: Whether to fall back to the internal router.
 
     Returns:
         AutorouteResult with success status and details.
     """
-    # Try Freerouting first
+    ok, dsn_path = export_dsn(board_path)
+    if not ok:
+        return AutorouteResult(
+            success=False,
+            message=f"DSN export failed: {dsn_path}",
+            method="freerouting",
+        )
+    logger.info("AUTOROUTE: exported DSN %s for %s", dsn_path, Path(board_path).name or board_path)
+
     jar = _find_freerouting_jar()
-    if jar and (_java_available() or not jar.endswith(".jar")):
-        # Export DSN
-        ok, dsn_path = export_dsn(board_path)
-        if not ok:
+    if not jar:
+        stale_hint = _kicad_pcm_stale_hint()
+        reason = "Freerouting was not found on this system."
+        if stale_hint:
+            reason = f"{reason} {stale_hint}"
+        logger.info("AUTOROUTE: Freerouting not installed; leaving manual DSN handoff at %s", dsn_path)
+        manual_msg = _manual_freerouting_message(
+            reason,
+            board_path,
+            dsn_path,
+        )
+        if not allow_manhattan_fallback:
             return AutorouteResult(
                 success=False,
-                message=f"DSN export failed: {dsn_path}",
+                message=manual_msg,
                 method="freerouting",
+                manual_required=True,
+                dsn_path=dsn_path,
             )
+        logger.warning("Freerouting not found; falling back to internal router.")
+        try:
+            Path(dsn_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+        return _grid_route_all(board_path)
 
-        # Run Freerouting
-        ok, ses_result = run_freerouting(dsn_path, timeout_seconds)
-        if not ok:
-            # Clean up and fall through to manhattan
-            try:
-                Path(dsn_path).unlink(missing_ok=True)
-            except Exception:
-                pass
-            logger.warning(f"Freerouting failed: {ses_result}. Falling back to manhattan routing.")
-        else:
-            # Import SES
-            ok, import_msg = import_ses(board_path, ses_result)
-            # Clean up temp files
-            try:
-                Path(dsn_path).unlink(missing_ok=True)
-                Path(ses_result).unlink(missing_ok=True)
-            except Exception:
-                pass
-
-            if ok:
-                return AutorouteResult(
-                    success=True,
-                    message="Board routed successfully via Freerouting",
-                    method="freerouting",
-                )
-            else:
+    if jar.endswith(".jar"):
+        if not _java_available():
+            logger.info("AUTOROUTE: Freerouting jar found but Java is unavailable; manual DSN handoff at %s", dsn_path)
+            manual_msg = _manual_freerouting_message(
+                "Freerouting was found but Java is not available to run the jar.",
+                board_path,
+                dsn_path,
+            )
+            if not allow_manhattan_fallback:
                 return AutorouteResult(
                     success=False,
-                    message=f"SES import failed: {import_msg}",
+                    message=manual_msg,
                     method="freerouting",
+                    manual_required=True,
+                    dsn_path=dsn_path,
                 )
+            logger.warning("Java unavailable for Freerouting; falling back to internal router.")
+            try:
+                Path(dsn_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+            return _grid_route_all(board_path)
 
-    # Fallback: grid-based A* routing
-    return _grid_route_all(board_path)
+        compat_issue = _freerouting_java_compatibility_issue(jar)
+        if compat_issue:
+            logger.warning("AUTOROUTE: Java/Freerouting compatibility issue: %s", compat_issue)
+            manual_msg = _manual_freerouting_message(
+                compat_issue,
+                board_path,
+                dsn_path,
+            )
+            if not allow_manhattan_fallback:
+                return AutorouteResult(
+                    success=False,
+                    message=manual_msg,
+                    method="freerouting",
+                    manual_required=True,
+                    dsn_path=dsn_path,
+                )
+            logger.warning("Freerouting Java compatibility issue; falling back to internal router.")
+            try:
+                Path(dsn_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+            return _grid_route_all(board_path)
+
+    logger.info("AUTOROUTE: launching Freerouting with %s", jar)
+    ok, ses_result = run_freerouting(dsn_path, timeout_seconds)
+    if not ok:
+        failure_message = str(ses_result or "")
+        logger.info("AUTOROUTE: Freerouting did not complete; manual DSN handoff remains at %s", dsn_path)
+        manual_msg = _manual_freerouting_message(
+            f"Freerouting failed: {failure_message}",
+            board_path,
+            dsn_path,
+        )
+        if not allow_manhattan_fallback:
+            return AutorouteResult(
+                success=False,
+                message=manual_msg,
+                method="freerouting",
+                manual_required=True,
+                dsn_path=dsn_path,
+            )
+        logger.warning("Freerouting failed: %s. Falling back to internal router.", ses_result)
+        try:
+            Path(dsn_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+        return _grid_route_all(board_path)
+
+    ok, import_msg = import_ses(board_path, ses_result)
+    try:
+        Path(dsn_path).unlink(missing_ok=True)
+        Path(ses_result).unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    if ok:
+        logger.info("AUTOROUTE: Freerouting session imported successfully")
+        return AutorouteResult(
+            success=True,
+            message="Board routed successfully via Freerouting",
+            method="freerouting",
+        )
+
+    return AutorouteResult(
+        success=False,
+        message=f"SES import failed: {import_msg}",
+        method="freerouting",
+    )
 
 
 # ── Grid-based A* autorouter ─────────────────────────────────────────────────
@@ -741,6 +1122,8 @@ def _grid_route_all(board_path: str) -> AutorouteResult:
                         track.SetNetCode(nc)
                     except Exception:
                         pass
+                if hasattr(track, 'thisown'):
+                    track.thisown = False
                 board.Add(track)
                 tracks_added += 1
 

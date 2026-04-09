@@ -172,6 +172,62 @@ class ComponentWebSearch:
 
         return results[:limit]
 
+    def search_github(self, query: str, limit: int = 5) -> List[ComponentInfo]:
+        """Search GitHub repositories for KiCad-related assets (repo-level, no auth).
+
+        This is used for symbol/footprint discovery queries where component
+        commerce APIs (LCSC/Mouser/etc.) are the wrong source.
+        """
+        q = (query or "").strip()
+        if len(q) < 2:
+            return []
+        # Remove common web-search syntax / boilerplate to improve GitHub repo search.
+        q = re.sub(r"\bsite:github\.com\b", " ", q, flags=re.I)
+        q = re.sub(r"\bkicad\b", " KiCad ", q, flags=re.I)
+        q = re.sub(r"\b(symbol|footprint|library|libraries)\b", " ", q, flags=re.I)
+        q = re.sub(r"\s+", " ", q).strip()
+        if not q:
+            q = "KiCad footprint"
+
+        url = f"https://api.github.com/search/repositories?q={quote_plus(q + ' KiCad')}&per_page={max(1, min(int(limit), 20))}"
+        req = Request(url, headers={
+            "User-Agent": "VibeCAD/0.4.0",
+            "Accept": "application/vnd.github+json",
+        })
+        try:
+            with urlopen(req, timeout=15, context=_SSL_CTX) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            logger.debug("GitHub search failed: %s", e)
+            return []
+
+        items = data.get("items") or []
+        if not isinstance(items, list):
+            return []
+        out: List[ComponentInfo] = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            full_name = str(it.get("full_name") or "").strip()
+            html_url = str(it.get("html_url") or "").strip()
+            desc = str(it.get("description") or "").strip()
+            owner = it.get("owner") if isinstance(it.get("owner"), dict) else {}
+            owner_login = str(owner.get("login") or "").strip()
+            if not full_name or not html_url:
+                continue
+            out.append(
+                ComponentInfo(
+                    mpn=full_name,
+                    manufacturer=owner_login or "github",
+                    description=desc or "GitHub repository (possible KiCad assets)",
+                    source="github",
+                    product_url=html_url,
+                )
+            )
+            if len(out) >= limit:
+                break
+        return out
+
     def get_datasheet_url(self, mpn: str) -> Optional[str]:
         """Try to find a datasheet URL for a given MPN.
 

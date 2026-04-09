@@ -11,7 +11,6 @@ from typing import List, Optional, Dict, Any
 from dataclasses import dataclass
 
 from .client import LLMClient, LLMMessage, LLMConfig, LLMError
-from ..checks.base import CheckResult, Finding
 
 
 logger = logging.getLogger(__name__)
@@ -20,7 +19,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ExplanationRequest:
     """Request for LLM explanation of check results."""
-    check_results: List[CheckResult]
+    check_results: List[Dict[str, Any]]
     user_question: Optional[str] = None
     project_context: Optional[Dict[str, Any]] = None
 
@@ -157,7 +156,7 @@ Provide a clear, concise answer:"""
         response = llm_client.explain_simple(prompt)
         return self._parse_explanation(response, request)
     
-    def explain_single_check(self, result: CheckResult, 
+    def explain_single_check(self, result: Dict[str, Any], 
                              user_question: Optional[str] = None) -> Explanation:
         """Convenience method to explain a single check result.
         
@@ -175,7 +174,7 @@ Provide a clear, concise answer:"""
         return self.explain(request)
     
     def answer_question(self, question: str, 
-                        check_results: List[CheckResult],
+                        check_results: List[Dict[str, Any]],
                         design_context: Optional[Dict[str, Any]] = None) -> AnswerResponse:
         """Answer a user question based on the current design data.
         
@@ -194,7 +193,17 @@ Provide a clear, concise answer:"""
             raise ValueError("Question cannot be empty")
         
         # Build context JSON
-        results_data = [r.to_dict() for r in check_results] if check_results else []
+        results_data: List[Dict[str, Any]] = []
+        for r in check_results or []:
+            if isinstance(r, dict):
+                results_data.append(dict(r))
+            elif hasattr(r, "to_dict") and callable(getattr(r, "to_dict")):
+                try:
+                    obj = r.to_dict()
+                    if isinstance(obj, dict):
+                        results_data.append(obj)
+                except Exception:
+                    continue
         check_results_json = json.dumps(results_data, indent=2)
         
         design_context_str = ""
@@ -217,7 +226,7 @@ Provide a clear, concise answer:"""
         return self._parse_answer(question, response, check_results)
     
     def _parse_answer(self, question: str, response: str, 
-                      check_results: List[CheckResult]) -> AnswerResponse:
+                      check_results: List[Dict[str, Any]]) -> AnswerResponse:
         """Parse LLM answer and extract references."""
         # Extract component references mentioned (patterns like R1, U3, C5, etc.)
         import re
@@ -319,7 +328,7 @@ Provide a clear, concise answer:"""
         return response[:500] if len(response) > 500 else response
     
 
-def explain_check_results(results: List[CheckResult], 
+def explain_check_results(results: List[Dict[str, Any]], 
                           user_question: Optional[str] = None,
                           config: Optional[LLMConfig] = None) -> Explanation:
     """Convenience function to explain check results.

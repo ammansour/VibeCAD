@@ -46,8 +46,14 @@ Repository = "https://github.com/vibecad/vibecad"
 requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools]
+include-package-data = true
+
 [tool.setuptools.packages.find]
 include = ["vibecad*"]
+
+[tool.setuptools.package-data]
+vibecad = ["icon.png"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

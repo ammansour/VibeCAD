@@ -424,6 +424,8 @@ class ConnectionManager:
                     if net:
                         via.SetNet(net)
                 
+                if hasattr(via, 'thisown'):
+                    via.thisown = False
                 if commit:
                     commit.Add(via)
                 else:
@@ -431,6 +433,8 @@ class ConnectionManager:
                 vias_created = 1
             
             # Add track
+            if hasattr(track, 'thisown'):
+                track.thisown = False
             if commit:
                 commit.Add(track)
             else:

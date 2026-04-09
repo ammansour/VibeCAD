@@ -460,6 +460,93 @@ class TestSettingsPersistence(unittest.TestCase):
             loaded = VibeCADSettings.load(p)
             self.assertTrue(loaded.verbose)
 
+    def test_default_settings_path_is_bundle_local(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        import vibecad.config.settings as settings_mod
+
+        with tempfile.TemporaryDirectory() as td:
+            bundle_root = Path(td) / "bundle" / "vibecad"
+            bundle_root.mkdir(parents=True)
+            with patch.object(settings_mod, "_bundle_root", return_value=bundle_root):
+                self.assertEqual(settings_mod.default_settings_path(), bundle_root / "vibecad_settings.json")
+                self.assertEqual(settings_mod.default_api_key_override_path(), bundle_root / "vibecad_api_key.local.txt")
+
+    def test_bundle_local_vertex_credentials_round_trip(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        import vibecad.config.settings as settings_mod
+
+        with tempfile.TemporaryDirectory() as td:
+            bundle_root = Path(td) / "bundle" / "vibecad"
+            bundle_root.mkdir(parents=True)
+            sa_path = bundle_root / "bundle-sa.json"
+            sa_path.write_text(
+                json.dumps(
+                    {
+                        "type": "service_account",
+                        "client_email": "bundle@example.com",
+                        "private_key": "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----\n",
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.object(settings_mod, "_bundle_root", return_value=bundle_root), \
+                 patch.object(settings_mod, "_preferred_repo_root", return_value=None), \
+                 patch.object(settings_mod, "_legacy_settings_path", return_value=bundle_root / "legacy-home.json"), \
+                 patch.object(settings_mod, "_read_api_key_override", return_value=""):
+                settings = settings_mod.VibeCADSettings(
+                    api_key="",
+                    api_base="",
+                    model="",
+                    verbose=True,
+                    vertex_credentials_path=str(sa_path),
+                )
+                saved_path = settings.save()
+                saved_data = json.loads(saved_path.read_text(encoding="utf-8"))
+                self.assertEqual(saved_data["vertex_credentials_path"], sa_path.name)
+
+                loaded = settings_mod.VibeCADSettings.load()
+                self.assertEqual(loaded.vertex_credentials_path, sa_path.name)
+
+    def test_bundle_local_vertex_credentials_auto_detect(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        import vibecad.config.settings as settings_mod
+
+        with tempfile.TemporaryDirectory() as td:
+            bundle_root = Path(td) / "bundle" / "vibecad"
+            bundle_root.mkdir(parents=True)
+            sa_path = bundle_root / "auto-sa.json"
+            sa_path.write_text(
+                json.dumps(
+                    {
+                        "type": "service_account",
+                        "client_email": "auto@example.com",
+                        "private_key": "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----\n",
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.object(settings_mod, "_bundle_root", return_value=bundle_root), \
+                 patch.object(settings_mod, "_preferred_repo_root", return_value=None), \
+                 patch.object(settings_mod, "_legacy_settings_path", return_value=bundle_root / "legacy-home.json"), \
+                 patch.object(settings_mod, "_read_api_key_override", return_value=""):
+                loaded = settings_mod.VibeCADSettings.load()
+                self.assertEqual(loaded.vertex_credentials_path, sa_path.name)
+
 
 class TestLLMExplainer(unittest.TestCase):
     """Tests for LLM explainer."""
@@ -488,6 +575,38 @@ class TestLLMExplainer(unittest.TestCase):
         request = ExplanationRequest(check_results=[result])
         with self.assertRaises(LLMError):
             explainer.explain(request)
+
+
+class TestVertexCredentialsResolution(unittest.TestCase):
+    def test_relative_credentials_path_resolves_against_bundle(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        import vibecad.llm.vertex_client as vertex_client
+
+        with tempfile.TemporaryDirectory() as td:
+            bundle_root = Path(td) / "bundle" / "vibecad"
+            bundle_root.mkdir(parents=True)
+            sa_path = bundle_root / "client.json"
+            sa_path.write_text(
+                json.dumps(
+                    {
+                        "type": "service_account",
+                        "client_email": "bundle@example.com",
+                        "private_key": "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----\n",
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.object(vertex_client, "_bundle_root", return_value=bundle_root):
+                self.assertEqual(
+                    vertex_client._resolve_credentials_json_path(sa_path.name),
+                    str(sa_path.resolve()),
+                )
 
 
 class TestBOMExporter(unittest.TestCase):

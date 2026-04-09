@@ -17,7 +17,6 @@ The LLM must NEVER:
 
 from .client import LLMClient, LLMConfig, LLMError
 from .explainer import IssueExplainer, Explanation, AnswerResponse, ExplanationRequest
-from .suggestion_explainer import SuggestionExplainer, SuggestionExplanation
 
 __all__ = [
     'LLMClient', 
@@ -27,6 +26,4 @@ __all__ = [
     'Explanation',
     'AnswerResponse',
     'ExplanationRequest',
-    'SuggestionExplainer',
-    'SuggestionExplanation',
 ]

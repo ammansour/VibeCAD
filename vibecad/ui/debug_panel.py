@@ -21,6 +21,8 @@ except Exception:
 
 logger = logging.getLogger(__name__)
 
+from . import theme
+
 
 class DebugPanel(wx.Panel if WX_AVAILABLE else object):
     def __init__(
@@ -38,6 +40,14 @@ class DebugPanel(wx.Panel if WX_AVAILABLE else object):
 
         self._timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self._on_timer, self._timer)
+        try:
+            self.Bind(wx.EVT_WINDOW_DESTROY, self._on_window_destroy)
+        except Exception:
+            pass
+        try:
+            self.Bind(wx.EVT_SYS_COLOUR_CHANGED, self._on_sys_colour_changed)
+        except Exception:
+            pass
 
         self._create_ui()
 
@@ -52,6 +62,12 @@ class DebugPanel(wx.Panel if WX_AVAILABLE else object):
     def _create_ui(self):
         sizer = wx.BoxSizer(wx.VERTICAL)
 
+        try:
+            self.SetBackgroundColour(theme.panel_bg_colour())
+            self.SetForegroundColour(theme.window_text_colour())
+        except Exception:
+            pass
+
         btn_row = wx.BoxSizer(wx.HORIZONTAL)
 
         self.refresh_btn = wx.Button(self, label="Refresh")
@@ -62,7 +78,7 @@ class DebugPanel(wx.Panel if WX_AVAILABLE else object):
         self.clear_btn.Bind(wx.EVT_BUTTON, self._on_clear_clicked)
         btn_row.Add(self.clear_btn, 0, wx.ALL, 3)
 
-        self.copy_btn = wx.Button(self, label="📋")
+        self.copy_btn = wx.Button(self, label="Copy")
         self.copy_btn.SetToolTip("Copy debug log to clipboard")
         self.copy_btn.Bind(wx.EVT_BUTTON, self._on_copy_clicked)
         btn_row.Add(self.copy_btn, 0, wx.ALL, 3)
@@ -73,6 +89,10 @@ class DebugPanel(wx.Panel if WX_AVAILABLE else object):
             self,
             label="Shows recent VibeCAD command/log output (copyable).",
         )
+        try:
+            self._hint.SetForegroundColour(theme.muted_text_colour())
+        except Exception:
+            pass
         btn_row.Add(self._hint, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 3)
 
         sizer.Add(btn_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 5)
@@ -81,6 +101,11 @@ class DebugPanel(wx.Panel if WX_AVAILABLE else object):
             self,
             style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_RICH2,
         )
+        try:
+            self.text.SetBackgroundColour(theme.chat_surface_colour())
+            self.text.SetForegroundColour(theme.window_text_colour())
+        except Exception:
+            pass
         sizer.Add(self.text, 1, wx.EXPAND | wx.ALL, 5)
 
         self.SetSizer(sizer)
@@ -97,6 +122,34 @@ class DebugPanel(wx.Panel if WX_AVAILABLE else object):
                 self.text.Bind(evt, self._on_user_scroll)
             except Exception:
                 pass
+
+    def _on_sys_colour_changed(self, evt):
+        self._apply_theme()
+        try:
+            evt.Skip()
+        except Exception:
+            pass
+
+    def _apply_theme(self) -> None:
+        if not WX_AVAILABLE:
+            return
+        try:
+            self.SetBackgroundColour(theme.panel_bg_colour())
+            self.SetForegroundColour(theme.window_text_colour())
+        except Exception:
+            pass
+        try:
+            if hasattr(self.text, "SetBackgroundColour"):
+                self.text.SetBackgroundColour(theme.chat_surface_colour())
+            if hasattr(self.text, "SetForegroundColour"):
+                self.text.SetForegroundColour(theme.window_text_colour())
+        except Exception:
+            pass
+        try:
+            if hasattr(self._hint, "SetForegroundColour"):
+                self._hint.SetForegroundColour(theme.muted_text_colour())
+        except Exception:
+            pass
 
     def _on_user_scroll(self, evt):
         try:
@@ -157,6 +210,20 @@ class DebugPanel(wx.Panel if WX_AVAILABLE else object):
 
     def _on_timer(self, _evt):
         self.refresh_now()
+
+    def _on_window_destroy(self, evt):
+        self.shutdown()
+        try:
+            evt.Skip()
+        except Exception:
+            pass
+
+    def shutdown(self) -> None:
+        try:
+            if getattr(self, "_timer", None) is not None and self._timer.IsRunning():
+                self._timer.Stop()
+        except Exception:
+            pass
 
     def _on_clear_clicked(self, _evt):
         try:

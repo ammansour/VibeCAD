@@ -1,3 +1,9 @@
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║  UNIVERSAL PLUGIN — NO BOARD-SPECIFIC HARDCODING IN THIS FILE      ║
+# ║  Prompts must use only goal_str / context variables.               ║
+# ║  Never embed specific MPNs, part names, board names, or            ║
+# ║  design-specific quantities in prompt strings or system prompts.   ║
+# ╚══════════════════════════════════════════════════════════════════════╝
 """
 Provider-agnostic LLM client using OpenAI-compatible API.
 
@@ -22,9 +28,6 @@ from urllib.error import URLError, HTTPError
 
 logger = logging.getLogger(__name__)
 
-# Guardrail: prevent pathological token requests from user settings
-# from exhausting provider context windows.
-MAX_COMPLETION_TOKENS = 8192
 # Some providers return an empty completion (finish_reason="length") when the
 # input prompt consumes most/all of the context window. Keep prompts bounded.
 MAX_PROMPT_CHARS = int(os.environ.get("VIBECAD_MAX_PROMPT_CHARS", "40000") or "40000")
@@ -42,8 +45,13 @@ class LLMConfig:
     
     # Request parameters
     temperature: float = 0.3  # Low temperature for consistent explanations
-    max_tokens: int = 2048
+    max_tokens: int = 4096
     timeout: int = 30
+    top_p: Optional[float] = None  # Nucleus sampling; None = provider default
+
+    # Thinking / reasoning (extended chain-of-thought token budget)
+    enable_thinking: bool = False
+    thinking_budget: int = 8000  # Tokens reserved for reasoning; ignored when enable_thinking=False
 
     # TLS / SSL
     verify_ssl: bool = True
@@ -95,7 +103,7 @@ class LLMConfig:
             api_base=api_base,
             model=model,
             temperature=float(os.environ.get('VIBECAD_TEMPERATURE', '0.3')),
-            max_tokens=int(os.environ.get('VIBECAD_MAX_TOKENS', '2048')),
+            max_tokens=int(os.environ.get('VIBECAD_MAX_TOKENS', '4096')),
             timeout=int(os.environ.get('VIBECAD_TIMEOUT', '30')),
             verify_ssl=_parse_bool(os.environ.get('VIBECAD_SSL_VERIFY', ''), True),
             ca_bundle=os.environ.get('VIBECAD_CA_BUNDLE', '').strip(),
@@ -170,8 +178,12 @@ When explaining issues, structure your response as:
         """Check if the LLM service is available."""
         return self.config.is_configured
     
-    def chat(self, messages: List[LLMMessage], 
-             system_prompt: Optional[str] = None) -> LLMResponse:
+    def chat(
+        self,
+        messages: List[LLMMessage],
+        system_prompt: Optional[str] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+    ) -> LLMResponse:
         """Send a chat completion request with retries.
 
         Raises LLMError on failure.
@@ -201,21 +213,21 @@ When explaining issues, structure your response as:
         # Build payload
         token_key = 'max_completion_tokens' if self._prefers_max_completion_tokens() else 'max_tokens'
         requested_tokens = int(self.config.max_tokens)
-        token_budget = max(256, min(requested_tokens, MAX_COMPLETION_TOKENS))
-        if requested_tokens > MAX_COMPLETION_TOKENS:
-            logger.warning(
-                "Requested max_tokens=%d exceeds safety cap; clamping to %d",
-                requested_tokens,
-                MAX_COMPLETION_TOKENS,
-            )
+        token_budget = max(256, requested_tokens)
         payload: Dict[str, Any] = {
             'model': self.config.model,
             'messages': [m.to_dict() for m in all_messages],
             token_key: token_budget,
         }
+        if isinstance(response_format, dict) and response_format and not self.config.enable_thinking:
+            payload["response_format"] = response_format
         temp = self._temperature_payload_value()
         if temp is not None:
             payload['temperature'] = temp
+        if self.config.top_p is not None:
+            payload['top_p'] = float(self.config.top_p)
+        if self.config.enable_thinking:
+            payload.update(self._thinking_payload(self.config.thinking_budget))
 
         headers = {
             'Content-Type': 'application/json',
@@ -239,6 +251,7 @@ When explaining issues, structure your response as:
         import time
         last_error: Optional[LLMError] = None
         saw_empty_length = False
+        removed_response_format = False
         for attempt in range(self.config.max_retries):
             try:
                 response = self._make_request(url, payload, headers)
@@ -257,6 +270,17 @@ When explaining issues, structure your response as:
 
                 # On empty-content / finish_reason=length, bump token budget once
                 msg = str(e)
+                # Some OpenAI-compatible proxies don't support response_format.
+                # Retry once without it (still within the same request budget).
+                if (
+                    not removed_response_format
+                    and payload.get("response_format") is not None
+                    and int(getattr(e, "status_code", 0) or 0) in (400, 404)
+                    and ("response_format" in msg.lower() or "json_object" in msg.lower() or "json schema" in msg.lower())
+                ):
+                    payload.pop("response_format", None)
+                    removed_response_format = True
+                    continue
                 if "Empty LLM response content" in msg and "finish_reason='length'" in msg:
                     # Two common causes:
                     # 1) Provider uses a different response schema (parser issue).
@@ -279,8 +303,8 @@ When explaining issues, structure your response as:
                     else:
                         # Subsequent retry: increase budget (helps when the model did produce
                         # visible output but got cut off, yet parser saw empty).
-                        if token_budget < 4096:
-                            token_budget = min(8192, max(512, token_budget * 2))
+                        if token_budget < requested_tokens:
+                            token_budget = min(requested_tokens, max(512, token_budget * 2))
 
                     payload[token_key] = token_budget
                     # Try both keys for maximum compatibility with OpenAI-style proxies.
@@ -316,13 +340,44 @@ When explaining issues, structure your response as:
 
         return False
 
+    def _thinking_payload(self, budget: int) -> Dict[str, Any]:
+        """Return provider-appropriate thinking/reasoning payload keys.
+
+        Different providers expose extended reasoning via different fields:
+        - Anthropic (Claude):  thinking.type + budget_tokens (requires temp=1)
+        - Google (Gemini):     thinking_budget (top-level extension param)
+        - OpenRouter generic:  reasoning.effort  (routed to provider-specific form)
+        - Others:              best-effort — send both Gemini and OpenRouter keys.
+        """
+        model = (self.config.model or "").strip().lower()
+        base  = (self.config.api_base or "").strip().lower()
+        budget = max(1, int(budget))
+
+        if "claude" in model or "anthropic" in base:
+            # Anthropic extended thinking — the API also requires temperature=1.
+            return {"thinking": {"type": "enabled", "budget_tokens": budget}}
+
+        if "gemini" in model or "aiplatform.googleapis.com" in base:
+            # Google Vertex AI / Gemini models.
+            return {"thinking_budget": budget}
+
+        # OpenRouter and other OpenAI-compatible providers.
+        return {"reasoning": {"effort": "high"}}
+
     def _temperature_payload_value(self) -> Optional[float]:
         """Return the temperature to send, or None to omit the parameter.
 
         Some models (notably GPT-5 via GitHub Models) only support the default
         temperature value. In those cases we omit `temperature` entirely.
+        Anthropic Claude with thinking enabled requires temperature=1.0.
         """
         model = (self.config.model or "").strip().lower()
+        base  = (self.config.api_base or "").strip().lower()
+
+        # Claude + thinking requires temperature=1.0 (hard requirement).
+        if self.config.enable_thinking and ("claude" in model or "anthropic" in base):
+            return 1.0
+
         if not model:
             return self.config.temperature
 
@@ -379,6 +434,11 @@ When explaining issues, structure your response as:
             raise LLMError(f"Connection error: {e.reason}")
         except json.JSONDecodeError as e:
             raise LLMError(f"Invalid JSON response: {e}")
+        except (TimeoutError, OSError) as e:
+            # socket.timeout (subclass of TimeoutError/OSError) escapes urlopen without
+            # being wrapped in URLError on some Python versions. Convert it so the retry
+            # loop in chat() can retry it like any other LLMError.
+            raise LLMError(f"Network timeout: {e}")
     
     def _parse_response(self, response: Dict[str, Any]) -> LLMResponse:
         """Parse API response into LLMResponse."""

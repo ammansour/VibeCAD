@@ -2,27 +2,21 @@
 VibeCAD SubAgent Architecture.
 
 Decomposes the monolithic DesignAgent into focused specialists:
-  - InfoGatheringAgent  — component search, datasheets, web lookup
-  - PlacementAgent      — smart component placement with spatial optimization
-  - RoutingAgent        — net assignment, track drawing, autorouting
-  - VerificationAgent   — DRC/ERC and iterative fix proposals
+  - ComponentCheckAgent — single v4 spec/BOM/component audit agent
+  - NetAssignAgent      — infer pad-level nets and trigger autorouting
   - Orchestrator        — phase-aware delegation to the right subagent
 """
 
 from .base import SubAgent, SubAgentResult
-from .info_gathering import InfoGatheringAgent
-from .placement import PlacementAgent
-from .routing import RoutingAgent
-from .verification import VerificationAgent
+from .component_check import ComponentCheckAgent
+from .net import NetAssignAgent
 from .orchestrator import Orchestrator, DesignPhase
 
 __all__ = [
     "SubAgent",
     "SubAgentResult",
-    "InfoGatheringAgent",
-    "PlacementAgent",
-    "RoutingAgent",
-    "VerificationAgent",
+    "ComponentCheckAgent",
+    "NetAssignAgent",
     "Orchestrator",
     "DesignPhase",
 ]

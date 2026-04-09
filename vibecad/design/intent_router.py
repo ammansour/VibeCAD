@@ -1,3 +1,9 @@
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║  UNIVERSAL PLUGIN — NO BOARD-SPECIFIC HARDCODING IN THIS FILE      ║
+# ║  Prompts must use only goal_str / context variables.               ║
+# ║  Never embed specific MPNs, part names, board names, or            ║
+# ║  design-specific quantities in prompt strings or system prompts.   ║
+# ╚══════════════════════════════════════════════════════════════════════╝
 """LLM-based intent routing for the Design tab.
 
 Goal: avoid starting the autonomous AgentLoop for simple informational Q&A.
@@ -24,16 +30,29 @@ class LLMClientLike(Protocol):
 
 @dataclass(frozen=True)
 class IntentDecision:
-    route: str  # 'qa' or 'agent'
+    route: str  # 'qa' | 'direct_tool' | 'agent'
     reason: str
 
 
 _SYSTEM_PROMPT = (
     "You are an intent router for a PCB design assistant UI. "
-    "Classify the user's message as either:\n"
+    "Classify the user's message as one of:\n"
     "- 'qa' (informational question; answer directly; do NOT start autonomous multi-step agent)\n"
-    "- 'agent' (a request to perform design work, generate/modify things, run multi-step tasks)\n\n"
-    "Return ONLY a compact JSON object like {\"route\":\"qa\"|\"agent\",\"reason\":\"...\"}. "
+    "- 'direct_tool' (focused tool tasks, multi-tool usage, querying board state, and making targeted changes:  "
+    "move one component, run/check wiring/DRC for a specific item, lookup part price/data)\n"
+    "- 'agent' (high-level build workflow requiring multi-phase autonomous planning: "
+    "SPEC + PLACE + NET)\n\n"
+    "Examples:\n"
+    "- 'move J1 right 5 in' -> direct_tool\n"
+    "- 'is the wiring of F1 correct' -> direct_tool\n"
+    "- 'what is the unit price of ADS1256' -> qa\n"
+    "- 'build an ESP32 board' -> agent\n\n"
+    "Hybrid precedence rules (single final route):\n"
+    "- qa + direct_tool -> direct_tool\n"
+    "- qa + agent/build -> agent\n"
+    "- direct_tool + agent/build -> agent\n\n"
+    "Return ONLY a compact JSON object like "
+    "{\"route\":\"qa\"|\"direct_tool\"|\"agent\",\"reason\":\"...\"}. "
     "No extra keys, no markdown."
 )
 
@@ -74,8 +93,21 @@ def decide_route(llm_client: Optional[LLMClientLike], message: str) -> IntentDec
             raise LLMError("Intent router returned invalid/empty JSON.")
 
         route = str(parsed.get("route", "")).strip().lower()
+        route_aliases = {
+            "tool": "direct_tool",
+            "tools": "direct_tool",
+            "direct": "direct_tool",
+            "direct-tool": "direct_tool",
+            "directtool": "direct_tool",
+            "action": "direct_tool",
+            "actions": "direct_tool",
+            "full_agent": "agent",
+            "workflow": "agent",
+            "builder": "agent",
+        }
+        route = route_aliases.get(route, route)
         reason = str(parsed.get("reason", "")).strip()[:240]
-        if route not in ("qa", "agent"):
+        if route not in ("qa", "direct_tool", "agent"):
             raise LLMError(f"Intent router returned invalid route: {route!r}")
 
         return IntentDecision(route=route, reason=reason or "llm")
@@ -87,3 +119,7 @@ def decide_route(llm_client: Optional[LLMClientLike], message: str) -> IntentDec
 
 def should_route_to_qa(llm_client: Optional[LLMClientLike], message: str) -> bool:
     return decide_route(llm_client, message).route == "qa"
+
+
+def should_route_to_direct_tool(llm_client: Optional[LLMClientLike], message: str) -> bool:
+    return decide_route(llm_client, message).route == "direct_tool"

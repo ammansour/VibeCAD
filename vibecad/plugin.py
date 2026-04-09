@@ -7,10 +7,14 @@ plugin system.
 
 import logging
 import os
+import re
 import tempfile
 import threading
+import time
+import json
+from datetime import datetime
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Any, Dict, Set
 
 from .debug_log import InMemoryLogBuffer, install_debug_log_capture
 
@@ -20,6 +24,20 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger('vibecad')
+
+# Enable basic crash logging via faulthandler
+try:
+    import faulthandler
+    crash_log_path = os.path.join(
+        os.path.expanduser("~"), ".kicad", "9.0", "vibecad_crash.log"
+    )
+    os.makedirs(os.path.dirname(crash_log_path), exist_ok=True)
+    crash_file = open(crash_log_path, "a", encoding="utf-8")
+    crash_file.write(f"\n--- VibeCAD Loaded: {datetime.now().isoformat()} ---\n")
+    crash_file.flush()
+    faulthandler.enable(file=crash_file)
+except Exception as e:
+    logger.warning(f"Could not enable faulthandler: {e}")
 
 # KiCad imports - these are available in KiCad's Python environment
 try:
@@ -45,17 +63,15 @@ except ImportError:
     logger.warning("wxPython not available")
 
 from .parsers import PCBParser, PCBData, SchematicParser, SchematicData
-from .checks import (
-    Check, CheckResult, 
-    MissingBoardOutlineCheck, 
-    BoardOutlineOpenCheck,
-    ComponentOutsideBoardCheck,
-)
-from .llm import LLMClient, LLMConfig, IssueExplainer, SuggestionExplainer
+from .llm import LLMClient, LLMConfig, IssueExplainer
 from .llm.explainer import Explanation, AnswerResponse
+from .llm.vertex_client import VertexAIClient
 from .config import VibeCADSettings
-from .actions import SuggestionManager, Suggestion, ActionResult
+from .config.settings import LLM_PROVIDER_VERTEX
 from .design.intent_router import decide_route
+from .plugin_benchmark_entry_mixin import BenchmarkEntryMixin
+from .plugin_sleep_guard_mixin import SleepGuardMixin
+from .plugin_benchmark_mixin import BenchmarkMixin
 
 # Phase 4: Design assistance imports
 try:
@@ -67,12 +83,14 @@ try:
         ComponentWebSearch, ComponentInfo,
     )
     DESIGN_AVAILABLE = True
-except ImportError:
+    DESIGN_IMPORT_ERROR = ""
+except ImportError as e:
     DESIGN_AVAILABLE = False
+    DESIGN_IMPORT_ERROR = str(e)
     logger.warning("Design module not available")
 
 
-class VibeCADPlugin:
+class VibeCADPlugin(BenchmarkEntryMixin, BenchmarkMixin, SleepGuardMixin):
     """Main VibeCAD plugin class for KiCad.
     
     This plugin provides LLM-assisted design review:
@@ -97,14 +115,13 @@ class VibeCADPlugin:
         self.pcb_data: Optional[PCBData] = None
         self.schematic_data: Optional[SchematicData] = None
         self.active_editor: str = "pcb"  # "pcb" or "schematic"
-        self.check_results: List[CheckResult] = []
+        self.check_results: List[Any] = []
         self.llm_client: Optional[LLMClient] = None
         # Always set; explainer methods will raise if LLM is unavailable.
         self.explainer: IssueExplainer = IssueExplainer(None)
-        
-        # Phase 3: Suggestion manager for assisted design actions
-        self.suggestion_manager = SuggestionManager()
-        self.suggestion_explainer: Optional[SuggestionExplainer] = None
+        # Persisted user settings are needed before design component init.
+        self.settings = VibeCADSettings.load()
+        self._design_init_error: str = ""
         
         # Phase 4: Design assistance components
         self.design_agent: Optional['DesignAgent'] = None
@@ -112,20 +129,21 @@ class VibeCADPlugin:
         self.connection_manager: Optional['ConnectionManager'] = None
         self.bom_exporter: Optional['BOMExporter'] = None
         self._agent_loop: Optional['AgentLoop'] = None
+        self._active_benchmark: Optional[Dict[str, Any]] = None
+        self._sleep_guard_proc: Optional[Any] = None
         self._init_design_components()
         
-        # Available checks
-        self.checks: List[Check] = [
-            MissingBoardOutlineCheck(),
-            BoardOutlineOpenCheck(),
-            ComponentOutsideBoardCheck(),  # Phase 3
-        ]
+        # Legacy deterministic checks/suggestions removed in v4-only mode.
+        self.checks: List[Any] = []
         
         # UI - now uses the new dockable frame
         self.frame = None
 
         # Host KiCad window captured at activation time (used for docking).
         self._host_frame = None
+        self._host_close_bound = False
+        self._host_close_parent = None
+        self._shutting_down = False
 
         # Persisted UI handles for cross-reload single-instance behavior.
         # (KiCad may reload the plugin module; pcbnew usually stays loaded.)
@@ -162,15 +180,16 @@ class VibeCADPlugin:
         self._docked_parent = None
         self._docked_mgr = None
         
-        # Persisted user settings (API key, endpoint, model, etc.)
-        self.settings = VibeCADSettings.load()
+        # (settings already loaded above before design component init)
 
-        # Restore verbose setting early so logs during initialization are consistent.
+        # Fixed output mode defaults:
+        # - Design output stays concise.
+        # - Debug logging stays verbose.
         try:
-            self._verbose_enabled = bool(getattr(self.settings, 'verbose', False))
-            self.set_verbose(self._verbose_enabled)
+            self._verbose_enabled = False
+            self._apply_debug_verbosity()
         except Exception:
-            # Never fail plugin init due to settings issues.
+            # Never fail plugin init due to logging configuration issues.
             self._verbose_enabled = False
 
         # Initialize LLM if configured
@@ -182,8 +201,11 @@ class VibeCADPlugin:
             """Apply LLM client (or None) to all subsystems."""
             self.llm_client = client
             self.explainer = IssueExplainer(client)
-            self.suggestion_explainer = SuggestionExplainer(client)
-            self.suggestion_manager.set_suggestion_explainer(self.suggestion_explainer)
+            if getattr(self, "library_manager", None) is not None:
+                try:
+                    self.library_manager.set_llm_client(client)
+                except Exception:
+                    logger.exception("Failed to update LibraryManager LLM client")
             if DESIGN_AVAILABLE and self.design_agent:
                 try:
                     self.design_agent.set_llm_client(client)
@@ -191,28 +213,66 @@ class VibeCADPlugin:
                     logger.exception("Failed to update DesignAgent LLM client")
 
         try:
-            config = LLMConfig.from_environment()
+            provider = str(getattr(self.settings, "llm_provider", "") or "")
 
-            # Apply persisted settings as overrides
-            try:
-                overrides = self.settings.to_llm_overrides()
-                for key, value in overrides.items():
-                    if hasattr(config, key):
-                        setattr(config, key, value)
-            except Exception:
-                logger.exception("Failed to apply persisted settings")
-
-            config.timeout = 30
-
-            if config.is_configured:
-                client = LLMClient(config)
+            if provider == LLM_PROVIDER_VERTEX:
+                # ── Vertex AI path ────────────────────────────────────────────
+                project = str(getattr(self.settings, "vertex_project", "") or "")
+                location = str(getattr(self.settings, "vertex_location", "us-central1") or "us-central1")
+                creds = str(getattr(self.settings, "vertex_credentials_path", "") or "")
+                model = str(getattr(self.settings, "model", "") or "")
+                temperature = getattr(self.settings, "temperature", None)
+                max_tokens = getattr(self.settings, "max_tokens", None)
+                timeout = getattr(self.settings, "timeout", None)
+                verify_ssl = bool(getattr(self.settings, "verify_ssl", True))
+                ca_bundle = str(getattr(self.settings, "ca_bundle_path", "") or "")
+                enable_thinking = bool(getattr(self.settings, "enable_thinking", False))
+                thinking_budget = getattr(self.settings, "thinking_budget", None)
+                if not project:
+                    logger.info("Vertex AI not configured (no GCP project ID)")
+                    _set_llm(None)
+                    return False
+                client = VertexAIClient(
+                    project=project,
+                    location=location,
+                    model=model or "google/gemini-2.0-flash-001",
+                    credentials_json_path=creds,
+                    verify_ssl=verify_ssl,
+                    ca_bundle=ca_bundle,
+                    temperature=float(temperature) if temperature is not None else 0.3,
+                    max_tokens=int(max_tokens) if max_tokens is not None else 16384,
+                    timeout=int(timeout) if timeout is not None else 120,
+                    enable_thinking=enable_thinking,
+                    thinking_budget=int(thinking_budget) if thinking_budget is not None else 8000,
+                )
                 _set_llm(client)
-                logger.info(f"LLM configured: {config.model} at {config.api_base}")
+                logger.info(f"LLM configured: Vertex AI project={project} location={location} model={client._model}")
                 return True
             else:
-                logger.info("LLM not configured (no API key)")
-                _set_llm(None)
-                return False
+                # ── OpenAI-compatible path (OpenRouter, GitHub, custom…) ──────
+                config = LLMConfig.from_environment()
+
+                # Apply persisted settings as overrides
+                try:
+                    overrides = self.settings.to_llm_overrides()
+                    for key, value in overrides.items():
+                        if hasattr(config, key):
+                            setattr(config, key, value)
+                except Exception:
+                    logger.exception("Failed to apply persisted settings")
+
+                _saved_timeout = getattr(self.settings, "timeout", None)
+                config.timeout = int(_saved_timeout) if _saved_timeout is not None else 30
+
+                if config.is_configured:
+                    client = LLMClient(config)
+                    _set_llm(client)
+                    logger.info(f"LLM configured: {config.model} at {config.api_base}")
+                    return True
+                else:
+                    logger.info("LLM not configured (no API key)")
+                    _set_llm(None)
+                    return False
         except Exception as e:
             logger.error(f"Failed to initialize LLM: {e}")
             _set_llm(None)
@@ -221,6 +281,7 @@ class VibeCADPlugin:
     def _init_design_components(self):
         """Initialize Phase 4 design assistance components."""
         if not DESIGN_AVAILABLE:
+            self._design_init_error = f"Design import failed: {DESIGN_IMPORT_ERROR or 'unknown import error'}"
             logger.info("Design components not available")
             return
         
@@ -229,6 +290,10 @@ class VibeCADPlugin:
             # Enable keyless GitHub search by default in the KiCad plugin runtime.
             # Curated repo downloads are left empty to avoid large/slow downloads.
             self.library_manager = LibraryManager(
+                llm_client=self.llm_client,
+                github_token=(getattr(self.settings, "github_token", "") or ""),
+                enable_easyeda_sources=False,
+                enable_snapeda_sources=False,
                 enable_github_sources=True,
                 enable_github_search=True,
                 github_curated_repos=[],
@@ -252,10 +317,12 @@ class VibeCADPlugin:
             self.design_agent.set_library_manager(self.library_manager)
             self.design_agent.set_connection_manager(self.connection_manager)
             self.design_agent.set_bom_exporter(self.bom_exporter)
+            self._design_init_error = ""
             
             logger.info("Phase 4 design components initialized")
         except Exception as e:
             logger.exception(f"Failed to initialize design components: {e}")
+            self._design_init_error = str(e)
             self.design_agent = None
     
     @property
@@ -266,6 +333,14 @@ class VibeCADPlugin:
     def Run(self):
         """KiCad plugin entry point - called when user activates the plugin."""
         logger.info("VibeCAD plugin activated")
+        # Help debug "why didn't my code change apply?" by logging import paths.
+        try:
+            import vibecad as _v
+            from vibecad.design import agent_loop as _al
+            logger.info("VibeCAD module path: %s", getattr(_v, "__file__", "?"))
+            logger.info("AgentLoop module path: %s", getattr(_al, "__file__", "?"))
+        except Exception:
+            pass
         
         if WX_AVAILABLE:
             self._show_frame()
@@ -273,30 +348,32 @@ class VibeCADPlugin:
             logger.error("wxPython not available - cannot show UI")
 
     def set_verbose(self, verbose: bool):
-        """Enable/disable verbose logging for debugging."""
-        self._verbose_enabled = bool(verbose)
+        """Deprecated UI toggle: design output remains concise, debug logs stay verbose."""
+        _ = bool(verbose)
+        self._verbose_enabled = False
+        self._apply_debug_verbosity()
 
-        # Persist verbose toggle like other settings (API key, model, etc.).
-        try:
-            if hasattr(self, 'settings') and self.settings is not None:
-                setattr(self.settings, 'verbose', bool(verbose))
-                self.settings.save()
-        except Exception:
-            logger.exception("Failed to persist verbose setting")
-
-        level = logging.DEBUG if verbose else logging.INFO
+    def _apply_debug_verbosity(self) -> None:
+        """Keep debug logging verbose regardless of design-output verbosity."""
+        level = logging.DEBUG
         logger.setLevel(level)
         logging.getLogger('vibecad').setLevel(level)
-        # Ensure LLM client logs are visible when verbose is enabled.
         logging.getLogger('vibecad.llm').setLevel(level)
         logging.getLogger('vibecad.llm.client').setLevel(level)
         for handler in logging.getLogger().handlers:
             handler.setLevel(level)
-        logger.info(f"Verbose mode {'enabled' if verbose else 'disabled'}")
 
     def _frame_alive(self) -> bool:
         """Return True if self.frame exists and hasn't been destroyed."""
-        if self.frame is None:
+        if self.frame is None or not WX_AVAILABLE:
+            return False
+
+        try:
+            # Accessing any wx method will raise if the C++ object is gone.
+            _ = self.frame.IsShown()
+            return True
+        except Exception:
+            self.frame = None
             return False
 
     def _wx_window_alive(self, win) -> bool:
@@ -307,13 +384,67 @@ class VibeCADPlugin:
             return True
         except Exception:
             return False
+
+    def _clear_persisted_ui_handles(self) -> None:
+        if not PCBNEW_AVAILABLE:
+            return
+        for attr in ("_VIBECAD_FRAME", "_VIBECAD_DOCKED_MGR", "_VIBECAD_DOCKED_PANEL"):
+            try:
+                setattr(pcbnew, attr, None)
+            except Exception:
+                pass
+
+    def _on_frame_before_destroy(self) -> None:
+        """Best-effort teardown before destroying the floating VibeCAD frame."""
         try:
-            # Accessing any wx method will raise if the C++ object is gone.
-            _ = self.frame.IsShown()
-            return True
+            self._stop_sleep_guard()
         except Exception:
-            self.frame = None
-            return False
+            pass
+
+        try:
+            if self._agent_loop and self._agent_loop.is_running:
+                self._agent_loop.pause()
+        except Exception:
+            pass
+
+        try:
+            if self._docked_panel is not None and self._docked_mgr is not None:
+                try:
+                    pane = self._docked_mgr.GetPane("VibeCAD")
+                    if pane.IsOk():
+                        try:
+                            self._docked_mgr.DetachPane(self._docked_panel)
+                        except Exception:
+                            pass
+                        try:
+                            self._docked_mgr.Update()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        self._docked_panel = None
+        self._docked_parent = None
+        self._docked_mgr = None
+        self.frame = None
+        self._clear_persisted_ui_handles()
+
+    def _on_host_frame_close(self, event) -> None:
+        """Let KiCad own host shutdown so the docked pane is not torn down early."""
+        try:
+            if getattr(self, "frame", None) is not None:
+                main_panel = getattr(self.frame, "main_panel", None)
+                if main_panel is not None:
+                    main_panel.Refresh()
+                    main_panel.Update()
+        except Exception:
+            pass
+        try:
+            event.Skip()
+        except Exception:
+            pass
 
     def _raise_existing_ui(self) -> bool:
         """If the UI already exists, bring it to front and return True."""
@@ -336,6 +467,10 @@ class VibeCADPlugin:
                     except Exception:
                         pass
                     return True
+                self._docked_panel = None
+                self._docked_parent = None
+                self._docked_mgr = None
+                self._clear_persisted_ui_handles()
         except Exception:
             pass
 
@@ -419,35 +554,63 @@ class VibeCADPlugin:
         # Cache the host frame we were launched from (used for docking).
         if self._wx_window_alive(parent):
             self._host_frame = parent
+            try:
+                if (not self._host_close_bound) or (self._host_close_parent is not parent):
+                    parent.Bind(wx.EVT_CLOSE, self._on_host_frame_close)
+                    self._host_close_bound = True
+                    self._host_close_parent = parent
+            except Exception:
+                pass
         
-        self.frame = VibeCADFrame(
-            parent,
-            title="VibeCAD Design Review",
-            on_run_checks=self._on_run_checks,
-            on_explain=self._on_explain,
-            on_ask=self._on_ask,
-            on_set_verbose=self.set_verbose,
-            on_toggle_dock=self._on_toggle_dock,
-            on_open_settings=self._on_open_settings,
-            # Phase 3: Suggestion callbacks
-            on_preview_suggestion=self._on_preview_suggestion,
-            on_apply_suggestion=self._on_apply_suggestion,
-            on_dismiss_suggestion=self._on_dismiss_suggestion,
-            on_explain_suggestion=self._on_explain_suggestion,
-            on_hide_all_previews=self._on_hide_all_previews,
-            # Phase 4: Design agent callbacks
-            on_design_message=self._on_design_message,
-            on_approve_action=self._on_approve_design_action,
-            on_reject_action=self._on_reject_design_action,
-            on_new_chat=self._on_new_chat,
-            initial_verbose=bool(getattr(self, '_verbose_enabled', False)),
-            # Debug tab callbacks
-            on_get_debug_text=self.get_debug_text,
-            on_clear_debug=self.clear_debug_text,
-        )
+        try:
+            self.frame = VibeCADFrame(
+                parent,
+                title="VibeCAD Design Review",
+                on_toggle_dock=self._on_toggle_dock,
+                on_open_settings=self._on_open_settings,
+                # Phase 4: Design agent callbacks
+                on_design_message=self._on_design_message,
+                on_run_benchmark=self._on_run_benchmark,
+                on_approve_action=self._on_approve_design_action,
+                on_reject_action=self._on_reject_design_action,
+                on_new_chat=self._on_new_chat,
+                on_llm_controls_changed=self._on_design_llm_controls_changed,
+                # Debug tab callbacks
+                on_get_debug_text=self.get_debug_text,
+                on_clear_debug=self.clear_debug_text,
+                on_before_destroy=self._on_frame_before_destroy,
+            )
+        except Exception:
+            self.frame = None
+            logger.exception("Failed to construct VibeCAD frame")
+            try:
+                self._clear_persisted_ui_handles()
+            except Exception:
+                pass
+            try:
+                if WX_AVAILABLE:
+                    wx.MessageBox(
+                        "VibeCAD failed to open. Check KiCad's Scripting Console for traceback.",
+                        "VibeCAD Error",
+                        wx.OK | wx.ICON_ERROR,
+                    )
+            except Exception:
+                pass
+            return
+
+        if self.frame is None:
+            logger.error("VibeCAD frame was not created")
+            return
         
         # Update LLM status indicator
         self.frame.set_llm_status(self.llm_configured)
+        try:
+            self.frame.set_llm_controls(
+                str(getattr(self.settings, "model", "") or ""),
+                bool(getattr(self.settings, "enable_thinking", False)),
+            )
+        except Exception:
+            pass
 
         try:
             logger.info("VibeCAD UI opened")
@@ -468,9 +631,42 @@ class VibeCADPlugin:
             pass
 
         # Wire pause callback for the agent loop
-        self.frame.set_pause_callback(self._on_pause_agent)
-        
-        self.frame.Show()
+        try:
+            self.frame.set_pause_callback(self._on_pause_agent)
+        except Exception:
+            logger.exception("Failed to wire pause callback")
+
+        try:
+            self.frame.Show()
+        except Exception:
+            logger.exception("Failed to show VibeCAD frame")
+            try:
+                self.frame.Destroy()
+            except Exception:
+                pass
+            self.frame = None
+            try:
+                self._clear_persisted_ui_handles()
+            except Exception:
+                pass
+            return
+
+        # Emulate the geometry updates that happen on a manual window resize.
+        try:
+            self.frame.Layout()
+            self.frame.SendSizeEvent()
+            wx.CallAfter(self.frame.SendSizeEvent)
+            wx.CallLater(90, self.frame.SendSizeEvent)
+        except Exception:
+            pass
+
+        try:
+            dp = getattr(self.frame, "design_panel", None)
+            if dp is not None and hasattr(dp, "_force_chat_layout"):
+                wx.CallAfter(dp._force_chat_layout, "plugin-frame-show")
+                wx.CallLater(120, dp._force_chat_layout, "plugin-frame-show-delayed")
+        except Exception:
+            pass
 
     def get_debug_text(self) -> str:
         """Return captured debug output for the UI."""
@@ -541,7 +737,24 @@ class VibeCADPlugin:
                 self.settings = new_settings
                 self._init_llm()
                 try:
+                    if getattr(self, "library_manager", None) is not None:
+                        self.library_manager.github_token = str(getattr(self.settings, "github_token", "") or "").strip()
+                        self.library_manager._warned_no_github_token = False
+                        self.library_manager.enable_easyeda_sources = False
+                        self.library_manager.enable_snapeda_sources = False
+                except Exception:
+                    logger.exception("Failed to apply library-source settings")
+                try:
                     self.frame.set_llm_status(self.llm_configured)
+                except Exception:
+                    pass
+
+                try:
+                    if self.frame and hasattr(self.frame, 'set_llm_controls'):
+                        self.frame.set_llm_controls(
+                            str(getattr(self.settings, 'model', '') or ''),
+                            bool(getattr(self.settings, 'enable_thinking', False)),
+                        )
                 except Exception:
                     pass
 
@@ -786,6 +999,12 @@ class VibeCADPlugin:
             )
             mgr.Update()
 
+            try:
+                panel.Refresh()
+                panel.Update()
+            except Exception:
+                pass
+
             self._docked_panel = panel
             self._docked_parent = parent
             self._docked_mgr = mgr
@@ -811,106 +1030,34 @@ class VibeCADPlugin:
     
     def _on_run_checks(self):
         """Handle run checks request from UI."""
-        def worker():
-            try:
-                self._load_pcb_data()
-
-                if self.pcb_data is None:
-                    wx.CallAfter(self.frame.set_error, "No PCB loaded. Open a PCB in KiCad first.")
-                    return
-
-                self.check_results = []
-                for check in self.checks:
-                    result = check.run(pcb_data=self.pcb_data)
-                    self.check_results.append(result)
-                    logger.info(f"Check {check.check_id}: {'PASS' if result.passed else 'FAIL'}")
-
-                # Phase 3: Generate suggestions for findings
-                suggestions = self.suggestion_manager.generate_suggestions(
-                    self.check_results, self.pcb_data
-                )
-                logger.info(f"Generated {len(suggestions)} suggestions")
-
-                wx.CallAfter(self.frame.set_results, self.check_results)
-
-                # Phase 3: Always notify the frame, even if empty, so the UI can
-                # update its empty-state messaging.
-                if hasattr(self.frame, 'set_suggestions'):
-                    wx.CallAfter(self.frame.set_suggestions, suggestions)
-                
-                wx.CallAfter(self.frame.set_status, 
-                           f"Completed {len(self.checks)} checks, {len(suggestions)} suggestions", "")
-            except Exception as e:
-                logger.exception("Error running checks")
-                wx.CallAfter(self.frame.set_error, str(e))
-
-        if not WX_AVAILABLE:
-            return
-        threading.Thread(target=worker, daemon=True).start()
+        if self.frame:
+            self.frame.add_design_response("ℹ️ Deterministic checks are removed in v4-only mode.")
     
     # === Phase 3: Suggestion Action Handlers ===
     
-    def _on_preview_suggestion(self, suggestion: Suggestion):
+    def _on_preview_suggestion(self, suggestion: Any):
         """Show preview overlay for a suggestion."""
-        try:
-            success = self.suggestion_manager.show_preview(suggestion)
-            if not success:
-                logger.warning(f"Could not show preview for {suggestion.suggestion_id}")
-        except Exception as e:
-            logger.exception(f"Error showing preview: {e}")
+        if self.frame:
+            self.frame.add_design_response("ℹ️ Suggestion previews are removed in v4-only mode.")
     
-    def _on_apply_suggestion(self, suggestion: Suggestion) -> ActionResult:
+    def _on_apply_suggestion(self, suggestion: Any) -> Dict[str, Any]:
         """Apply a suggestion after user approval."""
-        try:
-            board = None
-            if PCBNEW_AVAILABLE:
-                board = pcbnew.GetBoard()
-            
-            result = self.suggestion_manager.apply_suggestion(suggestion, board)
-            
-            if result.success:
-                logger.info(f"Applied suggestion: {result.message}")
-            else:
-                logger.warning(f"Failed to apply suggestion: {result.error}")
-            
-            return result
-        except Exception as e:
-            logger.exception(f"Error applying suggestion: {e}")
-            return ActionResult(
-                success=False,
-                suggestion_id=suggestion.suggestion_id,
-                message=f"Error: {e}",
-                error=str(e)
-            )
+        if self.frame:
+            self.frame.add_design_response("ℹ️ Suggestions are removed in v4-only mode.")
+        return {"success": False, "message": "suggestions removed"}
     
-    def _on_dismiss_suggestion(self, suggestion: Suggestion):
+    def _on_dismiss_suggestion(self, suggestion: Any):
         """Dismiss a suggestion."""
-        try:
-            pcb_filename = ""
-            if PCBNEW_AVAILABLE:
-                board = pcbnew.GetBoard()
-                if board:
-                    pcb_filename = board.GetFileName() or ""
-            
-            self.suggestion_manager.dismiss_suggestion(suggestion, pcb_filename)
-            logger.info(f"Dismissed suggestion: {suggestion.suggestion_id}")
-        except Exception as e:
-            logger.exception(f"Error dismissing suggestion: {e}")
+        if self.frame:
+            self.frame.add_design_response("ℹ️ Suggestions are removed in v4-only mode.")
     
-    def _on_explain_suggestion(self, suggestion: Suggestion) -> str:
+    def _on_explain_suggestion(self, suggestion: Any) -> str:
         """Get LLM explanation for a suggestion."""
-        try:
-            return self.suggestion_manager.get_explanation(suggestion)
-        except Exception as e:
-            logger.exception(f"Error getting suggestion explanation: {e}")
-            return f"Error: {e}"
+        return "Suggestion explanations are removed in v4-only mode."
     
     def _on_hide_all_previews(self):
         """Hide all preview overlays."""
-        try:
-            self.suggestion_manager.hide_all_previews()
-        except Exception as e:
-            logger.exception(f"Error hiding previews: {e}")
+        return
     
     # === Phase 4: Design Agent Handlers ===
 
@@ -935,6 +1082,8 @@ class VibeCADPlugin:
                 self.frame.set_agent_running(False)
             except Exception:
                 pass
+        self._stop_sleep_guard()
+        self._active_benchmark = None
         logger.info("New chat session started")
 
     def _on_design_message(self, message: str):
@@ -946,21 +1095,28 @@ class VibeCADPlugin:
         """
         if not DESIGN_AVAILABLE or not self.design_agent:
             if self.frame:
+                detail = ""
+                try:
+                    detail = (getattr(self, "_design_init_error", "") or "").strip()
+                except Exception:
+                    detail = ""
                 self.frame.add_design_response(
                     "\u274c Design assistance is not available. "
-                    "Please check the installation."
+                    + (f"Reason: {detail}" if detail else "Please check the installation.")
                 )
             return False
 
         # If the agent loop is awaiting user input, feed the answer
         if (self._agent_loop and
                 self._agent_loop.state == AgentState.AWAITING_INPUT):
+            self._start_sleep_guard()
             self._agent_loop.resume(message)
             return True
 
         # If paused, resume with the new message
         if (self._agent_loop and
                 self._agent_loop.state == AgentState.PAUSED):
+            self._start_sleep_guard()
             self._agent_loop.resume(message)
             if self.frame:
                 wx.CallAfter(self.frame.set_agent_running, True)
@@ -970,13 +1126,39 @@ class VibeCADPlugin:
         self._route_design_message_async(message)
         return False
 
+    def _on_design_llm_controls_changed(self, model: str, extended_reasoning: bool) -> None:
+        """Persist live model/reasoning changes coming from the Design tab."""
+        try:
+            self.settings.model = str(model or "").strip() or str(getattr(self.settings, "model", "") or "")
+            self.settings.enable_thinking = bool(extended_reasoning)
+            self.settings.thinking_budget = None
+            self.settings.save()
+        except Exception:
+            logger.exception("Failed to persist LLM control changes")
+            return
+
+        try:
+            self._init_llm()
+        except Exception:
+            logger.exception("Failed to reinitialize LLM after control change")
+
+        try:
+            if self.frame:
+                self.frame.set_llm_status(self.llm_configured)
+                self.frame.set_llm_controls(self.settings.model, self.settings.enable_thinking)
+        except Exception:
+            pass
+
     def _route_design_message_async(self, message: str) -> None:
-        """Route message to Q&A or AgentLoop using the LLM (non-blocking)."""
+        """Route message to Q&A, direct-tool mode, or AgentLoop (non-blocking)."""
         if not WX_AVAILABLE:
             try:
                 decision = decide_route(self.llm_client, message)
                 if decision.route == 'qa':
                     self._answer_design_question_async(message)
+                elif decision.route == 'direct_tool':
+                    # Non-wx fallback keeps behavior functional.
+                    self._start_agent_loop(message)
                 else:
                     self._start_agent_loop(message)
             except Exception:
@@ -988,6 +1170,15 @@ class VibeCADPlugin:
                 decision = decide_route(self.llm_client, message)
                 if decision.route == 'qa':
                     self._answer_design_question_async(message)
+                    try:
+                        if self.frame:
+                            wx.CallAfter(self.frame.set_agent_running, False)
+                    except Exception:
+                        pass
+                    return
+
+                if decision.route == 'direct_tool':
+                    self._handle_direct_tool_message_async(message)
                     try:
                         if self.frame:
                             wx.CallAfter(self.frame.set_agent_running, False)
@@ -1013,6 +1204,180 @@ class VibeCADPlugin:
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _handle_direct_tool_message_async(self, message: str) -> None:
+        """Handle a bounded tool request without launching the full AgentLoop."""
+        if not WX_AVAILABLE or not self.frame:
+            return
+        if not DESIGN_AVAILABLE or not self.design_agent:
+            wx.CallAfter(self.frame.add_design_response, "❌ Direct tool mode is unavailable because the design module failed to load.")
+            return
+        if not self.llm_client or not self.llm_client.is_available:
+            wx.CallAfter(self.frame.add_design_response, "❌ LLM is not available/configured. Configure it in ⚙ Settings and retry.")
+            return
+
+        # Load data before planning/execution so direct tool requests can reason
+        # over up-to-date board/schematic state.
+        try:
+            self._load_pcb_data()
+            self._load_schematic_data()
+        except Exception:
+            logger.debug("Pre-load board data failed for direct-tool mode", exc_info=True)
+
+        active_editor = self._detect_active_editor()
+        project_dir = ''
+        board = None
+        try:
+            if PCBNEW_AVAILABLE:
+                board = pcbnew.GetBoard()
+                if board:
+                    fn = board.GetFileName() or ''
+                    if fn:
+                        project_dir = str(Path(fn).expanduser().resolve().parent)
+        except Exception:
+            pass
+
+        outline_context = self._extract_outline_context(board=board, pcb_data=self.pcb_data)
+        context = {
+            'active_editor': active_editor,
+            'pcb_data': self.pcb_data,
+            'schematic_data': self.schematic_data,
+            'verbose': False,
+            'project_dir': project_dir,
+            **outline_context,
+        }
+
+        auto_execute_types = {
+            DesignActionType.SEARCH_PART,
+            DesignActionType.SEARCH_WEB,
+            DesignActionType.LOOKUP_DATASHEET,
+            DesignActionType.RUN_DRC,
+            DesignActionType.RUN_ERC,
+            DesignActionType.EXPORT_BOM,
+        }
+        yolo_enabled = bool(getattr(self.settings, 'yolo_auto_apply', False))
+
+        def _execute_action_blocking(action: 'DesignAction') -> Optional['DesignAction']:
+            try:
+                action.approved = True
+            except Exception:
+                pass
+            done = threading.Event()
+            result_box: Dict[str, Any] = {"result": None}
+
+            def _on_result(result):
+                result_box["result"] = result
+                done.set()
+
+            self._execute_action_on_gui(action, context, _on_result)
+            if not done.wait(timeout=120):
+                return None
+            res = result_box.get("result")
+            return res if res is not None else action
+
+        def worker():
+            try:
+                wx.CallAfter(self.frame.set_design_thinking, True)
+
+                assistant_message, request = self.design_agent.chat(message, context)
+                actions = list(getattr(request, 'interpreted_actions', []) or [])
+
+                if assistant_message:
+                    wx.CallAfter(self.frame.add_design_response, assistant_message)
+
+                if not actions:
+                    # Clarifying questions remain valid in YOLO mode.
+                    # If planning returns no actions, we wait for user input.
+                    return
+
+                # Direct-tool mode is intentionally bounded.
+                max_direct_actions = 3
+                if len(actions) > max_direct_actions:
+                    actions = actions[:max_direct_actions]
+                    wx.CallAfter(
+                        self.frame.add_design_response,
+                        f"ℹ️ Direct tool mode is limited to {max_direct_actions} actions per request; queued the first {max_direct_actions}.",
+                    )
+
+                yolo_notice_emitted = False
+                for action in actions:
+                    atype = getattr(action, "action_type", DesignActionType.UNKNOWN)
+                    try:
+                        preview = self.design_agent.create_preview(action, context)
+                    except Exception:
+                        preview = str(getattr(action, "preview_text", "") or "")
+
+                    if atype not in auto_execute_types and not yolo_enabled:
+                        wx.CallAfter(
+                            self.frame.add_design_action_preview,
+                            atype.name,
+                            str(getattr(action, "description", "") or atype.name),
+                            preview,
+                            action,
+                        )
+                        continue
+
+                    if atype not in auto_execute_types and yolo_enabled and not yolo_notice_emitted:
+                        yolo_notice_emitted = True
+                        wx.CallAfter(
+                            self.frame.add_design_response,
+                            "⚠️ YOLO mode is enabled — auto-applying direct-tool actions without approval.",
+                        )
+
+                    result = _execute_action_blocking(action)
+                    if result is None:
+                        wx.CallAfter(self.frame.add_design_response, f"❌ {atype.name} timed out.")
+                        continue
+
+                    ok = bool(getattr(result, "success", False))
+                    msg = str(getattr(result, "result_message", "") or "").strip()
+                    if msg:
+                        if msg.lstrip().startswith(("✅", "❌")):
+                            wx.CallAfter(self.frame.add_design_response, msg)
+                        else:
+                            wx.CallAfter(self.frame.add_design_response, f"{'✅' if ok else '❌'} {msg}")
+                    else:
+                        wx.CallAfter(
+                            self.frame.add_design_response,
+                            f"{'✅' if ok else '❌'} {atype.name} {'completed' if ok else 'failed'}.",
+                        )
+            except Exception as e:
+                logger.exception("Direct tool handling failed")
+                wx.CallAfter(self.frame.add_design_response, f"❌ Direct tool execution failed: {e}")
+            finally:
+                try:
+                    wx.CallAfter(self.frame.set_design_thinking, False)
+                except Exception:
+                    pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _qa_recent_conversation_text(self, max_turns: int = 8) -> str:
+        """Build compact recent chat context for follow-up Q&A continuity."""
+        if not self.design_agent:
+            return ""
+        try:
+            entries = self.design_agent.recent_history(max_turns=max_turns * 2)
+        except Exception:
+            return ""
+        if not entries:
+            return ""
+
+        lines: List[str] = []
+        for row in entries:
+            role = str(row.get("role", "") or "").strip().lower()
+            if role not in {"user", "assistant"}:
+                continue
+            text = str(row.get("content", "") or "").strip()
+            if not text:
+                continue
+            if "PROPOSED_ACTIONS:" in text:
+                text = text.split("PROPOSED_ACTIONS:", 1)[0].strip()
+            if len(text) > 700:
+                text = text[:700] + "\n...[truncated]"
+            lines.append(f"[{role.upper()}] {text}")
+
+        return "\n".join(lines[-max_turns:]).strip()
+
     def _answer_design_question_async(self, question: str) -> None:
         """Answer a user question in the Design tab without starting AgentLoop."""
         if not WX_AVAILABLE or not self.frame:
@@ -1020,6 +1385,13 @@ class VibeCADPlugin:
         if not self.llm_client or not self.llm_client.is_available:
             wx.CallAfter(self.frame.add_design_response, "❌ LLM is not available/configured. Configure it in ⚙ Settings and retry.")
             return
+
+        recent_conversation = self._qa_recent_conversation_text(max_turns=8)
+        if self.design_agent:
+            try:
+                self.design_agent.record_history_turn("user", question)
+            except Exception:
+                pass
 
         # Load PCB/schematic data NOW on the GUI thread (pcbnew not thread-safe).
         try:
@@ -1084,12 +1456,18 @@ class VibeCADPlugin:
                     "(component values, net connections, footprints) provided below.\n\n"
                     "Answer directly and concisely. Reference specific component designators (R1, U3, etc.) "
                     "and net names from the board data when relevant. "
+                    "Use the recent conversation context to resolve follow-up answers. "
+                    "If the latest user message is short (for example a numbered reply like '1. TQFP-32'), "
+                    "treat it as a continuation of the most recent assistant clarification question. "
                     "If critical context is missing, ask 1-3 clarifying questions "
                     "and provide typical ranges or rules of thumb. "
                     "Do NOT propose tool/actions or start multi-step planning."
                 )
 
-                prompt_parts = [question.strip()]
+                prompt_parts = []
+                if recent_conversation:
+                    prompt_parts.append(f"--- RECENT CONVERSATION ---\n{recent_conversation}")
+                prompt_parts.append(f"--- LATEST USER MESSAGE ---\n{question.strip()}")
                 if circuit_context_str:
                     prompt_parts.append(f"\n\n--- CURRENT BOARD STATE ---\n{circuit_context_str}")
                 if web_context_str:
@@ -1101,6 +1479,11 @@ class VibeCADPlugin:
                 if not answer:
                     raise ValueError("LLM returned empty answer content.")
 
+                if self.design_agent:
+                    try:
+                        self.design_agent.record_history_turn("assistant", answer)
+                    except Exception:
+                        pass
                 wx.CallAfter(self.frame.add_design_response, answer)
             except Exception as e:
                 logger.exception("Design Q&A failed")
@@ -1113,7 +1496,103 @@ class VibeCADPlugin:
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _start_agent_loop(self, message: str):
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    @staticmethod
+    def _bench_norm_part_id(value: str) -> str:
+        s = str(value or "").strip().lower()
+        s = re.sub(r"[^a-z0-9]+", "", s)
+        return s
+
+    @classmethod
+    def _bench_id_variants(cls, value: str) -> Set[str]:
+        raw = str(value or "").strip()
+        if not raw:
+            return set()
+        out: Set[str] = set()
+        n0 = cls._bench_norm_part_id(raw)
+        if n0:
+            out.add(n0)
+        if ":" in raw:
+            tail = raw.split(":", 1)[1].strip()
+            nt = cls._bench_norm_part_id(tail)
+            if nt:
+                out.add(nt)
+        return out
+
+    @classmethod
+    def _bench_ids_match(cls, a: str, b: str) -> bool:
+        av = cls._bench_id_variants(a)
+        bv = cls._bench_id_variants(b)
+        if not av or not bv:
+            return False
+        for x in av:
+            for y in bv:
+                if x == y:
+                    return True
+                # Allow fuzzy suffix/prefix match for library-qualified IDs.
+                if len(x) >= 10 and len(y) >= 10 and (x in y or y in x):
+                    return True
+        return False
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    def _start_agent_loop(self, message: str, benchmark: Optional[Dict[str, Any]] = None):
         """Create and wire an AgentLoop, then start it."""
         self._load_pcb_data()
         self._load_schematic_data()
@@ -1138,21 +1617,36 @@ class VibeCADPlugin:
             'active_editor': active_editor,
             'pcb_data': self.pcb_data,
             'schematic_data': self.schematic_data,
-            'verbose': bool(getattr(self, '_verbose_enabled', False)),
+            'verbose': False,
             'project_dir': project_dir,
         }
+        if benchmark:
+            initial_context.update(
+                {
+                    "benchmark_mode": True,
+                    "benchmark_bom_only": bool(benchmark.get("bom_only_mode", False)),
+                    "benchmark_workflow_version": "v4",
+                }
+            )
 
         config = AgentLoopConfig(
             max_iterations=50,
-            max_drc_retries=5,
+            max_drc_retries=10,
             auto_approve_readonly=True,
             yolo_auto_apply=bool(getattr(self.settings, 'yolo_auto_apply', False)),
+            # Component-by-component replanning is intentionally *not* forced by YOLO.
+            # We instead default to batch placement to keep the UI/logs manageable.
+            component_by_component_placement=bool(
+                getattr(self.settings, 'component_by_component_placement', False)
+            ),
+            placement_batch_size=int(getattr(self.settings, 'placement_batch_size', 0) or 0),
+            require_full_workflow=(False if benchmark else None),
         )
         self._agent_loop = AgentLoop(self.design_agent, config)
 
         # Wire callbacks (all use wx.CallAfter -- loop runs on background thread)
         self._agent_loop.set_ui_message_callback(
-            lambda text: wx.CallAfter(self.frame.add_design_response, text)
+            (lambda text: None) if benchmark else (lambda text: wx.CallAfter(self.frame.add_design_response, text))
         )
         self._agent_loop.set_ui_thinking_callback(
             (
@@ -1167,11 +1661,21 @@ class VibeCADPlugin:
             )
         )
         self._agent_loop.set_ui_response_callback(
-            lambda text: wx.CallAfter(self.frame.add_design_response, text)
+            lambda text: self._forward_agent_response_with_benchmark_capture(text, benchmark=benchmark)
+        )
+        self._agent_loop.set_phase_complete_callback(
+            lambda phase_name, phase_result: self._benchmark_queue_phase_score(
+                benchmark, self._agent_loop, phase_name, phase_result
+            )
         )
 
         def on_state_change(new_state):
+            self._benchmark_record_state_transition(benchmark, new_state)
+            if benchmark and self._agent_loop is not None:
+                self._benchmark_flush_pending_phase_scores(benchmark, self._agent_loop, new_state)
             def _handle():
+                if new_state in (AgentState.DONE, AgentState.ERROR, AgentState.PAUSED, AgentState.AWAITING_INPUT):
+                    self._stop_sleep_guard()
                 if not self.frame:
                     return
                 if new_state in (AgentState.DONE, AgentState.ERROR, AgentState.PAUSED):
@@ -1179,11 +1683,49 @@ class VibeCADPlugin:
                     self.frame.set_design_thinking(False)
                 elif new_state == AgentState.AWAITING_INPUT:
                     self.frame.set_agent_awaiting_input(True)
+                    if benchmark and self._agent_loop is not None:
+                        reply = self._benchmark_auto_clarify_reply(benchmark)
+                        if reply:
+                            try:
+                                self.frame.set_agent_awaiting_input(False)
+                            except Exception:
+                                pass
+                            try:
+                                self._agent_loop.resume(reply)
+                            except Exception:
+                                logger.exception("Benchmark auto-clarify resume failed")
+                            return
                 elif new_state == AgentState.AWAITING_APPROVAL:
                     self.frame.set_design_thinking(False)
                 elif new_state in (AgentState.PLANNING, AgentState.EXECUTING,
                                    AgentState.OBSERVING):
+                    self._start_sleep_guard()
                     self.frame.set_design_thinking(True)
+                    if benchmark and self._agent_loop is not None:
+                        ff = self._benchmark_fail_fast_before_geom(benchmark, self._agent_loop)
+                        if isinstance(ff, dict):
+                            warn_only = bool(benchmark.get("fail_fast_warn_only", False))
+                            try:
+                                gate = str(ff.get("gate", "") or "benchmark_fail_fast")
+                                msg = str(ff.get("message", "") or "Benchmark fail-fast triggered")
+                                if warn_only:
+                                    self.frame.add_design_response(
+                                        f"⚠️ Benchmark fail-fast warning ({gate}): {msg} (continuing run)"
+                                    )
+                                else:
+                                    self.frame.add_design_response(f"❌ Benchmark fail-fast ({gate}): {msg}")
+                            except Exception:
+                                pass
+                            if not warn_only:
+                                try:
+                                    self._agent_loop.stop()
+                                except Exception:
+                                    logger.exception("Benchmark fail-fast stop failed")
+                                return
+                # Benchmark run: finalize only on terminal states that naturally end execution.
+                # Keep PAUSED responsive (no heavy report build on pause click).
+                if benchmark and new_state in (AgentState.DONE, AgentState.ERROR):
+                    self._finalize_benchmark_report(benchmark, self._agent_loop)
             wx.CallAfter(_handle)
 
         self._agent_loop.set_state_change_callback(on_state_change)
@@ -1192,7 +1734,7 @@ class VibeCADPlugin:
             return {
                 'active_editor': self._detect_active_editor(),
                 'pcb_data': self.pcb_data,
-                'verbose': bool(getattr(self, '_verbose_enabled', False)),
+                'verbose': False,
                 'project_dir': project_dir,
             }
 
@@ -1208,6 +1750,7 @@ class VibeCADPlugin:
                     )
             except Exception:
                 pass
+        self._start_sleep_guard()
         self._agent_loop.run(message, initial_context)
 
     # -- Agent-loop helpers -----------------------------------------------
@@ -1216,6 +1759,7 @@ class VibeCADPlugin:
         """Pause the running agent loop (kill-switch)."""
         if self._agent_loop and self._agent_loop.is_running:
             self._agent_loop.pause()
+            self._stop_sleep_guard()
             if self.frame:
                 self.frame.add_design_response("Agent paused by user.")
                 self.frame.set_agent_running(False)
@@ -1253,6 +1797,79 @@ class VibeCADPlugin:
                 board = None
                 if PCBNEW_AVAILABLE:
                     board = pcbnew.GetBoard()
+                    # Defensive: sometimes KiCad returns a low-level SwigPyObject
+                    # rather than a proper pcbnew.BOARD wrapper (e.g. no board
+                    # open / editor context mismatch). Avoid passing it through.
+                    try:
+                        is_valid = (
+                            board is not None
+                            and hasattr(board, "GetFootprints")
+                            and hasattr(board, "Add")
+                            and hasattr(board, "GetFileName")
+                        )
+                        if not is_valid:
+                            sample = []
+                            try:
+                                sample = sorted(set(dir(board)))[:30] if board is not None else []
+                            except Exception:
+                                sample = []
+                            logger.error(
+                                "pcbnew.GetBoard() returned invalid board object; type=%s has_Add=%s has_GetFileName=%s attrs_sample=%s",
+                                type(board).__name__ if board is not None else "None",
+                                bool(hasattr(board, "Add")),
+                                bool(hasattr(board, "GetFileName")),
+                                sample,
+                            )
+                            board = None
+                    except Exception:
+                        # If inspection fails, treat board as unusable.
+                            logger.exception("Failed to validate pcbnew board object")
+                            board = None
+                    if board is not None:
+                        try:
+                            self._last_valid_board = board
+                        except Exception:
+                            pass
+                    elif hasattr(self, "_last_valid_board"):
+                        fallback_board = getattr(self, "_last_valid_board", None)
+                        if (
+                            fallback_board is not None
+                            and hasattr(fallback_board, "GetFootprints")
+                            and hasattr(fallback_board, "Add")
+                            and hasattr(fallback_board, "GetFileName")
+                        ):
+                            logger.warning("Reusing last valid pcbnew board after GetBoard() returned an invalid object")
+                            board = fallback_board
+
+                # If we don't have a valid board, fail fast with a user-visible error.
+                # Otherwise actions may appear to "succeed" in logs but not affect
+                # the actual PCB editor (wrong editor context / no board open).
+                if board is None and action.action_type in {
+                    DesignActionType.ADD_COMPONENT,
+                    DesignActionType.DELETE_COMPONENT,
+                    DesignActionType.MOVE_COMPONENT,
+                    DesignActionType.ROTATE_COMPONENT,
+                    DesignActionType.ALIGN_COMPONENTS,
+                    DesignActionType.DEFINE_BOARD_OUTLINE,
+                    DesignActionType.ADD_MOUNTING_HOLE,
+                    DesignActionType.ASSIGN_NETS,
+                    DesignActionType.DEFINE_NET,
+                    DesignActionType.DRAW_TRACK,
+                    DesignActionType.ADD_VIA,
+                    DesignActionType.AUTOROUTE_BOARD,
+                    DesignActionType.DELETE_TRACKS,
+                    DesignActionType.ADD_POLYGON,
+                    DesignActionType.ADD_TEXT,
+                    DesignActionType.SET_LAYER_COUNT,
+                }:
+                    action.success = False
+                    action.result_message = (
+                        "No active PCB board found. Open the PCB Editor with a board file "
+                        "(not the schematic editor) and try again."
+                    )
+                    action.executed = True
+                    result_callback(action)
+                    return
 
                 project_dir = context.get('project_dir', '')
                 try:
@@ -1266,7 +1883,7 @@ class VibeCADPlugin:
                 gui_context = {
                     'active_editor': 'pcb',
                     'pcb_data': self.pcb_data,
-                    'verbose': bool(getattr(self, '_verbose_enabled', False)),
+                    'verbose': False,
                     'board': board,
                     'project_dir': project_dir,
                 }
@@ -1282,7 +1899,7 @@ class VibeCADPlugin:
 
                 # Save board (best-effort)
                 try:
-                    if PCBNEW_AVAILABLE and board:
+                    if PCBNEW_AVAILABLE and board and hasattr(board, "GetFileName"):
                         fn = board.GetFileName() or ''
                         if fn:
                             pcbnew.SaveBoard(fn, board)
@@ -1290,13 +1907,6 @@ class VibeCADPlugin:
                     logger.debug("pcbnew.SaveBoard() failed (non-fatal)", exc_info=True)
 
                 self._safe_pcbnew_refresh()
-
-                # Let the wx event loop breathe so the UI stays responsive
-                # during rapid-fire action sequences.
-                try:
-                    wx.SafeYield()
-                except Exception:
-                    pass
 
                 result_callback(result)
             except Exception as e:
@@ -1346,18 +1956,21 @@ class VibeCADPlugin:
                     best = None
                     for item in results:
                         if getattr(item, 'local_footprint_path', None):
+                            if package_hint and not self.library_manager.footprint_path_matches_hint(str(getattr(item, 'local_footprint_path', '')), package_hint):
+                                continue
                             best = item
                             break
                     if best is None:
-                        best = results[0]
-                    fp_path = getattr(best, 'local_footprint_path', None)
-                    if not fp_path and getattr(best, 'footprint_url', None):
+                        if not package_hint:
+                            best = results[0]
+                    fp_path = getattr(best, 'local_footprint_path', None) if best is not None else None
+                    if best is not None and not fp_path and getattr(best, 'footprint_url', None):
                         dl = self.library_manager.download_item(
                             best, install=True, project_dir=project_dir
                         )
                         if dl.success and dl.footprint_path:
                             fp_path = dl.footprint_path
-                    if fp_path:
+                    if best is not None and fp_path:
                         resolved = (getattr(best, 'mpn', query), fp_path)
             if resolved:
                 if not action.parameters:
@@ -1402,7 +2015,7 @@ class VibeCADPlugin:
         context = {
             'active_editor': 'pcb',
             'pcb_data': self.pcb_data,
-            'verbose': bool(getattr(self, '_verbose_enabled', False)),
+            'verbose': False,
             'project_dir': project_dir,
         }
 
@@ -1566,6 +2179,100 @@ class VibeCADPlugin:
                 logger.debug("Failed to build focused context", exc_info=True)
 
         return context
+
+    def _extract_outline_context(self, board: Any = None, pcb_data: Optional[PCBData] = None) -> Dict[str, Any]:
+        """Extract board outline geometry for prompt context.
+
+        Returns keys expected by DesignAgent chat prompts:
+        outline_defined / has_board_outline / board_width / board_height /
+        board_origin_x / board_origin_y / board_center_x / board_center_y
+        """
+        out: Dict[str, Any] = {
+            "outline_defined": False,
+            "has_board_outline": False,
+            "board_width": None,
+            "board_height": None,
+            "board_origin_x": None,
+            "board_origin_y": None,
+            "board_center_x": None,
+            "board_center_y": None,
+        }
+
+        def _set_bbox(min_x: float, min_y: float, max_x: float, max_y: float) -> None:
+            w = float(max_x) - float(min_x)
+            h = float(max_y) - float(min_y)
+            if w <= 0.0 or h <= 0.0:
+                return
+            out["outline_defined"] = True
+            out["has_board_outline"] = True
+            out["board_width"] = round(w, 3)
+            out["board_height"] = round(h, 3)
+            out["board_origin_x"] = round(float(min_x), 3)
+            out["board_origin_y"] = round(float(min_y), 3)
+            out["board_center_x"] = round((float(min_x) + float(max_x)) / 2.0, 3)
+            out["board_center_y"] = round((float(min_y) + float(max_y)) / 2.0, 3)
+
+        # Prefer live board bounds when available (captures unsaved edits).
+        try:
+            if board is None and PCBNEW_AVAILABLE:
+                board = pcbnew.GetBoard()
+            if board is not None and PCBNEW_AVAILABLE:
+                to_mm = getattr(pcbnew, "ToMM", None)
+                if callable(to_mm):
+                    bb = board.GetBoardEdgesBoundingBox()
+                    bw_iu = int(bb.GetWidth())
+                    bh_iu = int(bb.GetHeight())
+                    if bw_iu > 0 and bh_iu > 0:
+                        x0 = float(to_mm(bb.GetX()))
+                        y0 = float(to_mm(bb.GetY()))
+                        w = float(to_mm(bw_iu))
+                        h = float(to_mm(bh_iu))
+                        _set_bbox(x0, y0, x0 + w, y0 + h)
+                        return out
+        except Exception:
+            logger.debug("Failed to read live board outline bounds", exc_info=True)
+
+        pdata = pcb_data if pcb_data is not None else self.pcb_data
+        if pdata is None:
+            return out
+        try:
+            has_outline = bool(getattr(pdata, "has_board_outline", False))
+        except Exception:
+            has_outline = False
+        if has_outline:
+            out["outline_defined"] = True
+            out["has_board_outline"] = True
+
+        xs: List[float] = []
+        ys: List[float] = []
+
+        try:
+            for ln in getattr(pdata, "board_outline_lines", []) or []:
+                xs.extend([float(ln.start.x), float(ln.end.x)])
+                ys.extend([float(ln.start.y), float(ln.end.y)])
+            for arc in getattr(pdata, "board_outline_arcs", []) or []:
+                xs.extend([float(arc.start.x), float(arc.mid.x), float(arc.end.x)])
+                ys.extend([float(arc.start.y), float(arc.mid.y), float(arc.end.y)])
+            for rect in getattr(pdata, "board_outline_rects", []) or []:
+                xs.extend([float(rect.start.x), float(rect.end.x)])
+                ys.extend([float(rect.start.y), float(rect.end.y)])
+            for poly in getattr(pdata, "board_outline_polygons", []) or []:
+                for pt in getattr(poly, "points", []) or []:
+                    xs.append(float(pt.x))
+                    ys.append(float(pt.y))
+            for circ in getattr(pdata, "board_outline_circles", []) or []:
+                cx = float(circ.center.x)
+                cy = float(circ.center.y)
+                r = float(circ.radius)
+                xs.extend([cx - r, cx + r])
+                ys.extend([cy - r, cy + r])
+        except Exception:
+            logger.debug("Failed parsing PCB outline geometry from parser snapshot", exc_info=True)
+            return out
+
+        if xs and ys:
+            _set_bbox(min(xs), min(ys), max(xs), max(ys))
+        return out
     
     def _load_pcb_data(self):
         """Load PCB data from KiCad or file."""
@@ -1641,27 +2348,26 @@ class VibeCADPlugin:
     
     def _load_schematic_data(self):
         """Load schematic data from KiCad or file."""
-        if not EESCHEMA_AVAILABLE:
-            self.schematic_data = None
-            return
-        
-        try:
-            # eeschema API (if available in KiCad 7+)
-            get_sch = getattr(eeschema, "GetSchematic", None)
-            if callable(get_sch):
-                sch = get_sch()
-                if sch:
-                    filename = getattr(sch, "GetFileName", lambda: None)()
-                    if filename and Path(filename).exists():
-                        parser = SchematicParser(filename)
-                        self.schematic_data = parser.parse()
-                        logger.info(f"Loaded schematic from file: {filename}")
-                        return
-        except Exception as e:
-            logger.debug(f"Could not load schematic via eeschema API: {e}")
+        self.schematic_data = None
+
+        if EESCHEMA_AVAILABLE:
+            try:
+                # eeschema API (if available in KiCad 7+)
+                get_sch = getattr(eeschema, "GetSchematic", None)
+                if callable(get_sch):
+                    sch = get_sch()
+                    if sch:
+                        filename = getattr(sch, "GetFileName", lambda: None)()
+                        if filename and Path(filename).exists():
+                            parser = SchematicParser(filename)
+                            self.schematic_data = parser.parse()
+                            logger.info(f"Loaded schematic from file: {filename}")
+                            return
+            except Exception as e:
+                logger.debug(f"Could not load schematic via eeschema API: {e}")
         
         # Try to find schematic file in the same directory as PCB
-        if self.pcb_data is None and PCBNEW_AVAILABLE:
+        if PCBNEW_AVAILABLE:
             try:
                 board = pcbnew.GetBoard()
                 if board:
@@ -1675,8 +2381,6 @@ class VibeCADPlugin:
                             return
             except Exception as e:
                 logger.debug(f"Could not load companion schematic: {e}")
-        
-        self.schematic_data = None
     
     def _get_explanation(self, question: Optional[str] = None) -> Explanation:
         """Get explanation for current check results.
@@ -1697,7 +2401,7 @@ class VibeCADPlugin:
         return self.explainer.explain(request)
     
     # CLI interface for standalone usage
-    def run_checks_on_file(self, pcb_path: str) -> List[CheckResult]:
+    def run_checks_on_file(self, pcb_path: str) -> List[Any]:
         """Run checks on a PCB file (for CLI/testing).
         
         Args:
@@ -1706,15 +2410,10 @@ class VibeCADPlugin:
         Returns:
             List of CheckResult objects
         """
-        parser = PCBParser(pcb_path)
-        self.pcb_data = parser.parse()
-        
+        _ = pcb_path
+        logger.info("run_checks_on_file is removed in v4-only mode.")
         self.check_results = []
-        for check in self.checks:
-            result = check.run(pcb_data=self.pcb_data)
-            self.check_results.append(result)
-        
-        return self.check_results
+        return []
     
     def explain_results(self, user_question: Optional[str] = None) -> Explanation:
         """Get explanation for current results.
@@ -1745,10 +2444,30 @@ class VibeCADAction(pcbnew.ActionPlugin if PCBNEW_AVAILABLE else object):
         self.category = "Design Review"
         self.description = "LLM-assisted design review for KiCad"
         self.show_toolbar_button = True
-        self.icon_file_name = ""  # Optional: path to icon
+        icon_path = Path(__file__).resolve().with_name("icon.png")
+        icon_value = str(icon_path) if icon_path.exists() else ""
+        self.icon_file_name = icon_value
+        self.dark_icon_file_name = icon_value
     
     def Run(self):
         global _VIBECAD_SINGLETON
+
+        def _clear_cached_state() -> None:
+            global _VIBECAD_SINGLETON
+            _VIBECAD_SINGLETON = None
+            if not PCBNEW_AVAILABLE:
+                return
+            for attr in (
+                "_VIBECAD_SINGLETON",
+                "_VIBECAD_FRAME",
+                "_VIBECAD_DOCKED_MGR",
+                "_VIBECAD_DOCKED_PANEL",
+            ):
+                try:
+                    setattr(pcbnew, attr, None)
+                except Exception:
+                    pass
+
         try:
             # First: if a prior instance exists (even across module reloads), raise it.
             if WX_AVAILABLE and PCBNEW_AVAILABLE:
@@ -1821,8 +2540,33 @@ class VibeCADAction(pcbnew.ActionPlugin if PCBNEW_AVAILABLE else object):
                         pass
 
             _VIBECAD_SINGLETON.Run()
+            return
         except Exception:
-            logger.exception("VibeCAD failed to start")
+            logger.exception("VibeCAD failed to start (first attempt)")
+
+        # Recovery path: stale KiCad-cached objects can survive code reloads.
+        # Reset all cached handles and try exactly once with a fresh plugin.
+        try:
+            _clear_cached_state()
+            _VIBECAD_SINGLETON = VibeCADPlugin()
+            if PCBNEW_AVAILABLE:
+                try:
+                    setattr(pcbnew, "_VIBECAD_SINGLETON", _VIBECAD_SINGLETON)
+                except Exception:
+                    pass
+            _VIBECAD_SINGLETON.Run()
+            return
+        except Exception:
+            logger.exception("VibeCAD failed to start (recovery attempt)")
+            try:
+                if WX_AVAILABLE:
+                    wx.MessageBox(
+                        "VibeCAD could not open. See KiCad's Scripting Console for details.",
+                        "VibeCAD Error",
+                        wx.OK | wx.ICON_ERROR,
+                    )
+            except Exception:
+                pass
 
 
 # Register with KiCad
