@@ -2,6 +2,8 @@
 
 A KiCad 7 Python plugin that integrates an LLM for **explanation, querying, and review assistance** — not autonomous design.
 
+![VibeCAD demo timelapse](./VibeCAD%20Demo.gif)
+
 ## Architecture
 
 - **Deterministic Python code** performs all parsing and rule checks
